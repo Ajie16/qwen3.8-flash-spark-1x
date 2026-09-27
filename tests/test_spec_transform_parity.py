@@ -263,7 +263,7 @@ def test_shadow_observe_smoke():
 
         g = SimpleNamespace(
             active_jobs = [make_job(FakeSeqIds())],
-            _spec_shadow_stats = None, _spec_shadow_errors = 0,
+            _spec_shadow_stats = None, _spec_shadow_errors = 0, _spec_shadow_diag = False,
             tokenizer = SimpleNamespace(actual_vocab_size = vocab),
         )
         # The real Generator has this as a method; the wrapper calls it on self
@@ -277,10 +277,16 @@ def test_shadow_observe_smoke():
                 for _ in range(window)
             ]
             Generator._spec_shadow_observe(g, batch_logits, draft_tokens, [0, 1], [1], set())
-        assert len(infos) == 2, infos
-        assert infos[0].startswith("spec-shadow: [interval] windows=50 "), infos[0]
-        assert "| [total] windows=50 " in infos[0]
-        assert "| [total] windows=100 " in infos[1]
+        # one startup diagnostic, then two wrap-safe records per 50 windows
+        assert len(infos) == 5, infos
+        assert infos[0].startswith("spec-shadow: first observe"), infos[0]
+        assert infos[1].startswith("spec-shadow-i w=50 "), infos[1]
+        assert infos[2].startswith("spec-shadow-t w=50 "), infos[2]
+        assert infos[3].startswith("spec-shadow-i w=50 "), infos[3]
+        assert infos[4].startswith("spec-shadow-t w=100 "), infos[4]
+        # every periodic record must fit TabbyAPI's ~56-char wrap budget on one line
+        for line in infos[1:]:
+            assert len(line) <= 56, f"record too long, would be wrapped: {line}"
 
         # Exception containment: a job whose state access raises is skipped with a
         # rate-limited warning; nothing propagates, stats are untouched

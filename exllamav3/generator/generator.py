@@ -29,6 +29,8 @@ _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
 # M1 shadow mode (docs/spec_sampling.md §3): observe-only expected spec-sampling
 # acceptance alongside the unchanged legacy match-verify
 _SPEC_SHADOW = _os.environ.get("EXL3_SPEC_SHADOW", "0") != "0"
+# Observe only every Nth draft window (1 = every window); the estimate stays unbiased
+_SPEC_SHADOW_EVERY = max(1, int(_os.environ.get("EXL3_SPEC_SHADOW_EVERY", "1")))
 
 class Generator:
 
@@ -276,6 +278,8 @@ class Generator:
         self._spec_shadow_logq = None
         self._spec_shadow_stats = None
         self._spec_shadow_errors = 0
+        self._spec_shadow_tick = 0
+        self._spec_shadow_diag = False
         if draft_confidence is None:
             draft_confidence = float(_os.environ.get("EXL3_DRAFT_CONFIDENCE", "0.4"))
         self.draft_confidence = draft_confidence
@@ -724,6 +728,12 @@ class Generator:
 
         self._draft_conf_round = None
         self._spec_shadow_logq = None
+        # Subsample under EXL3_SPEC_SHADOW_EVERY=N: only every Nth draft round exports
+        # logq and gets observed, so skipped rounds cost nothing at all
+        shadow = False
+        if _SPEC_SHADOW:
+            self._spec_shadow_tick += 1
+            shadow = self._spec_shadow_tick % _SPEC_SHADOW_EVERY == 0
 
         # Get shape of active batch
         batch_size = 0
@@ -800,13 +810,13 @@ class Generator:
             }
             if cal is not None:
                 params["export_draft_conf"] = True
-            if _SPEC_SHADOW:
+            if shadow:
                 params["export_draft_logq"] = True
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            if _SPEC_SHADOW:
+            if shadow:
                 logq = params.get("draft_logq")
                 if logq is not None:
                     if shadow_logq is None:
@@ -830,7 +840,7 @@ class Generator:
                     window = idx + 1
                     break
 
-        if _SPEC_SHADOW:
+        if shadow:
             self._spec_shadow_logq = shadow_logq
 
         if dev_draft:
@@ -1075,6 +1085,16 @@ class Generator:
                 continue
 
             spec = spec_sampling.extract_spec(job.sampler)
+            if not self._spec_shadow_diag:
+                # One-time startup diagnostic: proves the draft-side logq arrived and
+                # shows what the live sampler stack actually looks like
+                self._spec_shadow_diag = True
+                logger.info(
+                    "spec-shadow: first observe, logq_rows=%d window=%d steps=[%s] spec=%s",
+                    len(logq_rows), window,
+                    ", ".join(type(s).__name__ for s in getattr(job.sampler, "steps", None) or []),
+                    spec,
+                )
             if spec is None:
                 continue
 
@@ -1120,18 +1140,22 @@ class Generator:
             stats["i_windows"] += 1
             if stats["windows"] % 50 == 0:
                 # Means are per-position (denominator = draft positions, not windows),
-                # same basis for the interval and the running total; one sync for both
+                # same basis for the interval and the running total; one sync for both.
+                # TabbyAPI wraps log records at console width (~56 message chars after the
+                # prefix), so keep each record short enough to stay on one line:
+                # q = q_t1.0, q_t0.8, q_t0.6, q_shaped
                 vals = torch.cat((
                     stats["i_acc"] / max(stats["i_positions"], 1),
                     stats["acc"] / max(stats["positions"], 1),
                 )).tolist()
                 logger.info(
-                    "spec-shadow: [interval] windows=%d match=%.3f q_t1.0=%.3f q_t0.8=%.3f "
-                    "q_t0.6=%.3f q_shaped=%.3f | [total] windows=%d match=%.3f q_t1.0=%.3f "
-                    "q_t0.8=%.3f q_t0.6=%.3f q_shaped=%.3f",
+                    "spec-shadow-i w=%d m=%.3f q=%.3f,%.3f,%.3f,%.3f",
                     stats["i_windows"],
                     stats["i_match"] / max(stats["i_positions"], 1),
                     vals[0], vals[1], vals[2], vals[3],
+                )
+                logger.info(
+                    "spec-shadow-t w=%d m=%.3f q=%.3f,%.3f,%.3f,%.3f",
                     stats["windows"],
                     stats["match"] / max(stats["positions"], 1),
                     vals[4], vals[5], vals[6], vals[7],
