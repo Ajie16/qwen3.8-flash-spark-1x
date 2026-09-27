@@ -108,3 +108,36 @@ residual draw), keeping runs reproducible per seed.
 - origin is vcruz305/exllamav3 (no push access): at M3 either fork under the user's GitHub
   and open the PR from there, or send the patch series on an issue. Open a short tracking
   issue with this design + shadow-mode numbers before the PR.
+
+## 8. Review round 1 (self-audit, d26bb26+)
+
+Findings from re-reviewing against the sampler/draft code; all folded into the plan.
+
+1. **Executed sampler stack is fused, not discrete steps.** Our forced preset collapses to
+   `[SS_RepP, SS_Fused(MODE_SAMPLE_FILTERS, temp, top_k, top_p)]` (`_match_fused_tail`,
+   custom.py:279). The fused kernel emits only the sampled token, no probs — the original
+   "reuse the step math" approach does not apply. Instead: implement a standalone
+   `spec_transform(logits_row, past_ids) -> logp` in `spec_sampling.py` mirroring the fused
+   order semantics exactly (rep_penalty head -> temp -> top_k -> top_p), used ONLY by the
+   spec verify path; the fused fast path stays untouched. Parity test: same logits through
+   (a) fusion-disabled step stack vs (b) spec_transform must match bit-near. v1 supported
+   subset: temp/top_k/top_p + rep_penalty head. min_p and other SS_Fused modes -> legacy
+   fallback.
+2. **MTP state carry is the top integration risk (was missing).** After the window,
+   `job.mtp_last_hidden` must correspond to the last ACCEPTED position; the existing
+   carry/rewind machinery (`checkpoint_rewound`, `rewound_jobs` suppression, post-batch
+   draft carry update) must be reused by the spec path verbatim. Explicit M2 task + a
+   regression test that drafting continues from the correct state after mid-window rejects.
+3. **Confidence calibrator interaction.** Under sampled drafts, export conf = q(d_i)
+   instead of raw max logit. The calibrator re-calibrates online, but dynamic window
+   truncation thresholds will shift; re-sweep the DRAFT_CONFIDENCE sweet spot after M2.
+4. **q shaping (new, zero-cost acceptance upside).** Spec sampling is exact for ANY q, so
+   shape q toward p: apply the draft's own temp/top_k/top_p truncation to q before sampling
+   (its own statistics, no peek at p). Shadow mode evaluates raw / temp-scaled /
+   temp+truncated q variants and picks the default.
+5. **Shadow mode estimates are unbiased over the full window.** Target forward produces all
+   window logit rows regardless of where legacy match-verify cuts; shadow computes expected
+   acceptance for every position, not just up to the legacy cut.
+
+Engineering detail: all acceptance comparisons in log space
+(`log u < min(0, logp - logq)`) to avoid overflow for tiny q(d).
