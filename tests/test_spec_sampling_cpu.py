@@ -219,10 +219,44 @@ def test_q_sample_determinism():
     print("q_sample determinism/support ok")
 
 
+def test_transform_batched_parity():
+    # The batched window transform must equal the per-row 1D transform row for row,
+    # including rep penalty over growing optimistic prefixes (past + d_0..d_{i-1})
+    from exllamav3.generator.spec_sampling import (
+        spec_transform, spec_transform_batched, SpecTransform,
+    )
+    g = torch.Generator().manual_seed(7)
+    vocab, w, past_len = 512, 4, 300
+    logits = torch.randn(w, vocab, generator = g)
+    past_full = torch.randint(0, vocab, (past_len,), generator = g)
+    drafts = torch.randint(0, vocab, (w,), generator = g)
+    specs = [
+        SpecTransform(temperature = 0.6, top_k = 20, top_p = 0.95, temp_first = True),
+        SpecTransform(temperature = 0.8, top_k = 50, top_p = 0.9, temp_first = False,
+                      rep_p = 1.1, sustain_range = 128, decay_range = 64),
+        SpecTransform(rep_p = 1.05, sustain_range = 256, decay_range = 0),
+    ]
+    for spec in specs:
+        pasts = [torch.cat((past_full, drafts[:i])) for i in range(w)]
+        ref = torch.stack([spec_transform(logits[i], pasts[i], spec) for i in range(w)])
+        bat = spec_transform_batched(logits, pasts, spec)
+        assert torch.allclose(ref, bat, atol = 1e-6), f"batched transform diverges: {spec}"
+
+        # The rep penalty reads only the last sustain+decay+1 past tokens: slicing the
+        # past tail preserves the transform exactly (this is what the verifier captures)
+        if spec.rep_p != 1.0:
+            tail = pasts[-1][-(spec.sustain_range + spec.decay_range + 1):]
+            ref_full = spec_transform(logits[-1], pasts[-1], spec)
+            ref_tail = spec_transform(logits[-1], tail, spec)
+            assert torch.allclose(ref_full, ref_tail, atol = 1e-6), "tail slice changes p"
+    print("batched transform parity + tail-slice exactness ok")
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     test_residual_edge_cases()
     test_q_sample_determinism()
     test_verify_job_bookkeeping()
+    test_transform_batched_parity()
     test_emitted_distribution_exact()
     print("all spec-sampling CPU gates passed")
