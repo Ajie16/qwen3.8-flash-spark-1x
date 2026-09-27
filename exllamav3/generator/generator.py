@@ -24,6 +24,7 @@ from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
 import os as _os
+import math as _math
 _BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
 _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
 # M1 shadow mode (docs/spec_sampling.md §3): observe-only expected spec-sampling
@@ -31,6 +32,10 @@ _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
 _SPEC_SHADOW = _os.environ.get("EXL3_SPEC_SHADOW", "0") != "0"
 # Observe only every Nth draft window (1 = every window); the estimate stays unbiased
 _SPEC_SHADOW_EVERY = max(1, int(_os.environ.get("EXL3_SPEC_SHADOW_EVERY", "1")))
+# M2 exact speculative sampling (docs/spec_sampling.md §2): drafts sampled from the
+# shaped q, min(1, p/q) acceptance, (p-q)+ rejection resampling. Default off = master
+# behavior; jobs outside the supported sampler subset stay on legacy match-verify
+_SPEC_SAMPLING = _os.environ.get("EXL3_SPEC_SAMPLING", "0") != "0"
 
 class Generator:
 
@@ -280,6 +285,10 @@ class Generator:
         self._spec_shadow_errors = 0
         self._spec_shadow_tick = 0
         self._spec_shadow_diag = False
+        # M2: per-batch-row SpecTransform (or None) for the window being verified, and a
+        # one-shot flag for the calibrator-bypass notice
+        self._spec_draft_specs = None
+        self._spec_cal_warned = False
         if draft_confidence is None:
             draft_confidence = float(_os.environ.get("EXL3_DRAFT_CONFIDENCE", "0.4"))
         self.draft_confidence = draft_confidence
@@ -728,6 +737,7 @@ class Generator:
 
         self._draft_conf_round = None
         self._spec_shadow_logq = None
+        self._spec_draft_specs = None
         # Subsample under EXL3_SPEC_SHADOW_EVERY=N: only every Nth draft round exports
         # logq and gets observed, so skipped rounds cost nothing at all
         shadow = False
@@ -766,6 +776,7 @@ class Generator:
         # Collect input IDs
         input_ids_list = []
         mtp_hidden_list = []
+        row_jobs = []
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
@@ -779,7 +790,20 @@ class Generator:
             job_ids = job.get_input_ids_list()
             input_ids_list += job_ids
             mtp_hidden_list.append(job.mtp_last_hidden)
+            row_jobs.append(job)
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
+
+        # M2: per-row spec eligibility (EXL3_SPEC_SAMPLING). Eligible rows get drafts
+        # sampled from the shaped q and min(1, p/q) verification; ineligible rows keep
+        # argmax drafts and legacy match-verify. Stored for the verify loop, whose batch
+        # rows follow the same order.
+        specs = None
+        if _SPEC_SAMPLING:
+            from . import spec_sampling
+            specs = [spec_sampling.job_spec(job) for job in row_jobs]
+            if not any(specs):
+                specs = None
+            self._spec_draft_specs = specs
         # Device-resident draft chain (EXL3_MTP_DEVICE_DRAFT): ids stay on the draft device
         # between steps (the Embedding mirrors its table there), so the window costs one
         # readback instead of one per drafted token
@@ -792,14 +816,26 @@ class Generator:
             batch_ids = self.draft_input_ids_pinned[:batch_size, :]
             batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
-        # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
-        # every row's running product of estimated conditional acceptance probabilities falls
-        # below the confidence target, keeping the first low-confidence token as the label probe
+        # Greedy sample batched draft tokens (spec-eligible rows sample from the shaped q
+        # instead). As in iterate_draftmodel_gen, drafting stops once every row's running
+        # product of estimated conditional acceptance probabilities falls below the
+        # confidence target, keeping the first low-confidence token as the label probe.
+        # With spec sampling the calibrator's match-based thresholds no longer apply
+        # (design §8.3), so it is bypassed for spec rounds and windows run full length.
         window = self.num_draft_tokens
         cal = self.draft_calibrator
+        if specs is not None and cal is not None:
+            if not self._spec_cal_warned:
+                self._spec_cal_warned = True
+                logger.info(
+                    "spec-sampling: draft confidence calibrator bypassed for spec rounds "
+                    "(full windows; threshold re-sweep pending, design 8.3)"
+                )
+            cal = None
         conf_cols = []
         reach = None
         shadow_logq = None
+        want_q = shadow or specs is not None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -810,18 +846,28 @@ class Generator:
             }
             if cal is not None:
                 params["export_draft_conf"] = True
-            if shadow:
+            if want_q:
                 params["export_draft_logq"] = True
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            if shadow:
+            if want_q:
                 logq = params.get("draft_logq")
                 if logq is not None:
+                    logq = logq.view(logq.shape[0], -1)
                     if shadow_logq is None:
                         shadow_logq = []
-                    shadow_logq.append(logq.view(logq.shape[0], -1))
+                    shadow_logq.append(logq)
+                    if specs is not None:
+                        # Draft d_i ~ shaped q for spec-eligible rows (design §2.1); the
+                        # argmax rows are untouched. Draws are seeded from each job's rng
+                        # in position-major, row order for per-seed reproducibility.
+                        new_ids = new_ids.clone()
+                        for r, s in enumerate(specs):
+                            if s is None: continue
+                            seed = row_jobs[r].rng.randint(0, (1 << 32) - 1)
+                            new_ids[r, 0] = spec_sampling.q_sample(logq[r], seed)[0]
             if dev_draft:
                 dev_draft_ids[:, idx:idx+1] = new_ids
                 batch_ids = new_ids
@@ -840,7 +886,7 @@ class Generator:
                     window = idx + 1
                     break
 
-        if shadow:
+        if want_q:
             self._spec_shadow_logq = shadow_logq
 
         if dev_draft:
@@ -1069,22 +1115,14 @@ class Generator:
             jj = j
             j += 1
 
-            # Same constraints as the serial loop's batch-verify gate: anything that makes
-            # the per-position distribution depend on state the shadow doesn't model
-            # (filters, forced tokens, masks, prob exports, multi-sequence, healing) skips
-            if (
-                id(job) in rewound_jobs or
-                len(job.sequences) != 1 or
-                job.filters or
-                job.forced_ids is not None or
-                job.return_probs or
-                job.return_top_tokens > 0 or
-                job.device_logit_mask is not None or
-                job.new_tokens < 0
-            ):
+            # Same eligibility as the M2 spec path (spec_sampling.job_spec): anything
+            # that makes the per-position distribution depend on state the shadow doesn't
+            # model (filters, forced tokens, masks, prob exports, multi-sequence,
+            # healing) or a sampler stack outside the supported subset skips
+            if id(job) in rewound_jobs:
                 continue
 
-            spec = spec_sampling.extract_spec(job.sampler)
+            spec = spec_sampling.job_spec(job)
             if not self._spec_shadow_diag:
                 # One-time startup diagnostic: proves the draft-side logq arrived and
                 # shows what the live sampler stack actually looks like
@@ -1164,6 +1202,139 @@ class Generator:
                 stats["i_positions"] = 0
                 stats["i_match"] = 0
                 stats["i_acc"].zero_()
+
+
+    def _spec_verify_job(
+        self,
+        job,
+        j: int,
+        job_logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        batch_states,
+        results: list,
+        rewound_jobs: set,
+        completed_jobs: list,
+        requeuing_jobs: list,
+        reject_remainder,
+    ):
+        """
+        Exact speculative verification of one job's window (design §2). Per position i,
+        p_i is the job sampler's post-transform distribution over past IDs advanced by
+        the accepted prefix; the q-sampled draft d_i is accepted iff
+        log u < min(0, logp(d_i) - logq(d_i)); on rejection a token drawn from
+        renorm((p_i - q)+) is emitted and the window is cut. The output distribution is
+        exactly p regardless of q (Leviathan et al. 2023); q only affects speed.
+
+        Token/state bookkeeping (accepted_length, reject_remainder, EOS / requeue /
+        banned-string-rewind handling, checkpoint boundaries) mirrors the legacy serial
+        loop branch-for-branch, so the post-batch MTP carry keyed on accepted_lengths —
+        draft-cache realignment and mtp_last_hidden pointing at the last ACCEPTED
+        position (design §8.2) — applies unchanged. RNG draws come from job.rng in a
+        fixed serial order: per-position accept u, then the residual draw on rejection.
+        Returns (accepted_length, rejected) with the same semantics as the legacy loop.
+        """
+        from . import spec_sampling
+
+        spec = self._spec_draft_specs[j]
+        logq_rows = self._spec_shadow_logq
+        window = draft_tokens.shape[-1]
+        device = job_logits.device
+        vocab_size = self.tokenizer.actual_vocab_size
+        accepted_length = 1
+        rejected = 0
+        use_past = spec.rep_p != 1.0
+
+        for i in range(job_logits.shape[1]):
+            token_logits = job_logits[:, i:i + 1, :]
+            next_k_tokens = next_k_probs = next_prob = None
+
+            if i < window:
+                logits_row = job_logits[0, i].float()
+                if vocab_size < logits_row.shape[-1]:
+                    logits_row[vocab_size:] = -float("inf")
+                past = job.current_device_ids if use_past else None
+                logp = spec_sampling.spec_transform(logits_row, past, spec)
+                # The same shaped q the draft was sampled from
+                logq = spec_sampling.shaped_q(logq_rows[i][j].to(device))
+                d = int(draft_tokens[j, i].item())
+                n2 = logq.shape[-1]
+                # q is zero outside the pruned-head slice; such drafts accept with
+                # probability 1 (they are never produced by q-sampled rows anyway)
+                if d < n2:
+                    thresh = min(0.0, float(logp[d]) - float(logq[d]))
+                else:
+                    thresh = 0.0
+                accepted = _math.log(job.rng.random()) < thresh
+                if accepted:
+                    next_token = draft_tokens[j, i].view(1, 1)
+                else:
+                    probs = spec_sampling.spec_residual_probs(logp, logq)
+                    gen = torch.Generator(device = device)
+                    gen.manual_seed(job.rng.randint(0, (1 << 32) - 1))
+                    next_token = torch.multinomial(probs, 1, generator = gen).view(1, 1)
+            else:
+                # Full window accepted: the bonus token is a plain sample from the real
+                # sampler stack, distribution p by construction
+                next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                    token_logits,
+                )
+
+            eos, sampled_token, rq = job.receive_sample(
+                token_logits,
+                next_token,
+                next_k_tokens,
+                next_k_probs,
+                next_prob,
+                results,
+            )
+
+            # Requeue: unconsumed draft positions must be rejected so the recurrent state
+            # and page positions match the accepted sequence before the requeue stash
+            if len(job.sequences) == 1 and rq:
+                rejected = reject_remainder(job, j, i, batch_states)
+                requeuing_jobs.append(job)
+                break
+
+            # EOS: draft positions from here on were fed to verification but never
+            # resolved; count them as rejected (no cache/state rollback needed)
+            if eos:
+                num_unresolved = job_logits.shape[1] - 1 - i
+                if num_unresolved:
+                    job.rejected_draft_tokens += num_unresolved
+                    for r_ in reversed(results):
+                        if r_.get("eos") and r_["job"] is job:
+                            if "rejected_draft_tokens" in r_:
+                                r_["rejected_draft_tokens"] = job.rejected_draft_tokens
+                            break
+                completed_jobs.append(job)
+                break
+
+            # Banned-string rewind: the remaining positions extend a sequence that no
+            # longer exists; abandon them (everything is already consistent)
+            if job.checkpoint_rewound:
+                job.checkpoint_rewound = False
+                rewound_jobs.add(id(job))
+                job.rejected_draft_tokens += job_logits.shape[1] - 1 - i
+                rejected = -1
+                break
+
+            if i < window:
+                # A recurrent checkpoint boundary stops draft acceptance so state can be
+                # stashed at an exact page boundary (as in the legacy loop)
+                cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+                if not accepted or cp_boundary:
+                    rejected = reject_remainder(job, j, i, batch_states)
+                    break
+
+                job.accepted_draft_tokens += 1
+                accepted_length += 1
+
+                # Spec-eligible jobs have no filters; advance masks and past IDs so the
+                # next position's p (and the bonus-row sampler call) see the prefix
+                job.prepare_logit_mask()
+                job.prepare_sampling_past_ids()
+
+        return accepted_length, rejected
 
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
@@ -1380,11 +1551,41 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
+            # M2 exact speculative sampling (EXL3_SPEC_SAMPLING): engages per job when the
+            # draft round carried per-row specs and q rows; everything else takes the
+            # legacy match-verify body below
+            spec_round = (
+                _SPEC_SAMPLING and draft_tokens is not None and
+                self._spec_draft_specs is not None and
+                self._spec_shadow_logq is not None and
+                len(self._spec_shadow_logq) >= draft_tokens.shape[-1]
+            )
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
                 rejected = 0
+
+                if (
+                    spec_round and j < len(self._spec_draft_specs) and
+                    self._spec_draft_specs[j] is not None and id(job) not in rewound_jobs
+                ):
+                    accepted_length, rejected = self._spec_verify_job(
+                        job, j, job_logits, draft_tokens, batch_states, results,
+                        rewound_jobs, completed_jobs, requeuing_jobs, reject_remainder,
+                    )
+                    # Same post-window tail as the legacy body below
+                    if batch_states and rejected == 0:
+                        batch_states[j].rewind(0)
+                    if rejected != -1 and self.record_draft_stats:
+                        job.draft_stats.append((
+                            job.new_tokens,
+                            draft_tokens.shape[-1],
+                            accepted_length - 1,
+                        ))
+                    accepted_lengths.append(accepted_length)
+                    j += 1
+                    continue
 
                 # Batched verify (EXL3_BATCH_VERIFY): sample every position of the verification
                 # window in one sampler call and compare against the draft on-device, so the
