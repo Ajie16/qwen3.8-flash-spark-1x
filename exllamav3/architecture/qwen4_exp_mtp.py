@@ -197,6 +197,10 @@ class Qwen4ExpMTPModel(Model):
                 xh = torch.empty_like(x)
                 y = torch.empty((b * q, n2), dtype = torch.half, device = x.device)
                 ext.exl3_gemm(x, tr, y, inner.suh, xh, svh, -1, inner.mcg, inner.mul1, 0)
+                if params.get("export_draft_logq"):
+                    # Spec-sampling shadow/spec payload: fp32 log-probs over the pruned
+                    # head slice. Passthrough export only; the argmax draft is unchanged
+                    params["draft_logq"] = torch.log_softmax(y.float(), dim = -1).view(b, q, n2)
                 if params.get("export_draft_conf"):
                     # -dds: conf is the raw max logit, identical to the full head's when the
                     # argmax is in-slice; lower otherwise, so drafting stops earlier
@@ -205,6 +209,10 @@ class Qwen4ExpMTPModel(Model):
                     return ids.view(b, q)
                 return torch.argmax(y, dim = -1).view(b, q)
         logits = lm.forward(state, params)
+        if params.get("export_draft_logq"):
+            params["draft_logq"] = torch.log_softmax(
+                logits[..., :self.attached_model().config.vocab_size].float(), dim = -1
+            )
         if params.get("export_draft_conf"):
             logits = logits[..., :self.attached_model().config.vocab_size]
             conf, ids = torch.max(logits, dim = -1)

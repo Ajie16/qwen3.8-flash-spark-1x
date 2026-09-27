@@ -26,6 +26,9 @@ from ..util import profile_opt
 import os as _os
 _BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
 _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
+# M1 shadow mode (docs/spec_sampling.md §3): observe-only expected spec-sampling
+# acceptance alongside the unchanged legacy match-verify
+_SPEC_SHADOW = _os.environ.get("EXL3_SPEC_SHADOW", "0") != "0"
 
 class Generator:
 
@@ -268,6 +271,10 @@ class Generator:
         # leaving the calibrator inert
         self.draft_calibrator = None
         self._draft_conf_round = None
+        # M1 shadow mode: per-position draft log-prob rows for the window currently being
+        # verified (list of (batch, head_n) fp32 tensors), plus process-level counters
+        self._spec_shadow_logq = None
+        self._spec_shadow_stats = None
         if draft_confidence is None:
             draft_confidence = float(_os.environ.get("EXL3_DRAFT_CONFIDENCE", "0.4"))
         self.draft_confidence = draft_confidence
@@ -715,6 +722,7 @@ class Generator:
     def iterate_draftmodel_mtp_gen(self, results: list):
 
         self._draft_conf_round = None
+        self._spec_shadow_logq = None
 
         # Get shape of active batch
         batch_size = 0
@@ -780,6 +788,7 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+        shadow_logq = None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -790,10 +799,18 @@ class Generator:
             }
             if cal is not None:
                 params["export_draft_conf"] = True
+            if _SPEC_SHADOW:
+                params["export_draft_logq"] = True
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
+            if _SPEC_SHADOW:
+                logq = params.get("draft_logq")
+                if logq is not None:
+                    if shadow_logq is None:
+                        shadow_logq = []
+                    shadow_logq.append(logq.view(logq.shape[0], -1))
             if dev_draft:
                 dev_draft_ids[:, idx:idx+1] = new_ids
                 batch_ids = new_ids
@@ -811,6 +828,9 @@ class Generator:
                 if idx + 1 < window and max(reach) < cal.confidence:
                     window = idx + 1
                     break
+
+        if _SPEC_SHADOW:
+            self._spec_shadow_logq = shadow_logq
 
         if dev_draft:
             # one readback for the whole window
@@ -969,6 +989,102 @@ class Generator:
             buf = torch.zeros(shape, dtype = dtype, pin_memory = True)
             self.staging_buffers[key] = buf
         return buf[:rows]
+
+
+    def _spec_shadow_observe(
+        self,
+        batch_logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        logit_mapping: list,
+        accepted_lengths: list,
+        rewound_jobs: set,
+    ):
+        """
+        M1 shadow mode (docs/spec_sampling.md §3): for every window position, compute the
+        expected spec-sampling acceptance sum_x min(p(x), q(x)) under four q shapings, and
+        log running means next to the legacy match rate. Pure observation; runs after the
+        legacy match-verify has fully resolved the window and must not touch job state.
+
+        The estimate is unbiased over the full window (§8.5): the target forward produced
+        all window logit rows regardless of where legacy match-verify cut, so every draft
+        position contributes, not just those up to the cut.
+        """
+        from . import spec_sampling
+
+        logq_rows = self._spec_shadow_logq
+        window = draft_tokens.shape[-1]
+        if len(logq_rows) < window:
+            return
+        stats = self._spec_shadow_stats
+        if stats is None:
+            stats = self._spec_shadow_stats = {
+                "windows": 0, "positions": 0, "match": 0, "acc": None,
+            }
+        device = batch_logits.device
+        vocab_size = self.tokenizer.actual_vocab_size
+
+        j = 0
+        for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+            if a == b: continue
+            accepted_length = accepted_lengths[j]
+            jj = j
+            j += 1
+
+            # Same constraints as the serial loop's batch-verify gate: anything that makes
+            # the per-position distribution depend on state the shadow doesn't model
+            # (filters, forced tokens, masks, prob exports, multi-sequence, healing) skips
+            if (
+                id(job) in rewound_jobs or
+                len(job.sequences) != 1 or
+                job.filters or
+                job.forced_ids is not None or
+                job.return_probs or
+                job.return_top_tokens > 0 or
+                job.device_logit_mask is not None or
+                job.new_tokens < 0
+            ):
+                continue
+
+            spec = spec_sampling.extract_spec(job.sampler)
+            if spec is None:
+                continue
+
+            if stats["acc"] is None:
+                stats["acc"] = torch.zeros(4, dtype = torch.float64, device = device)
+
+            seq = job.sequences[0]
+            # The legacy verify already resolved this window: sequence_ids now holds the
+            # window-start sequence plus the accepted draft prefix d_0..d_{k-1} and the
+            # token sampled at the cut. Under spec semantics the verification prefix at
+            # position i is the accepted prefix extended with the drafted d_0..d_{i-1};
+            # past the legacy cut no real accepted prefix exists, so approximate it with
+            # the draft continuation (rep-penalty past-ids only — a measurement
+            # approximation, not a behavior change).
+            base_ids = seq.sequence_ids.torch().to(device, non_blocking = True)
+            k = accepted_length - 1
+            drafts = draft_tokens[jj, :window].to(device, non_blocking = True)
+
+            for i in range(window):
+                past = base_ids if i <= k else torch.cat((base_ids, drafts[k:i]))
+                logits_row = batch_logits[a, i].float()
+                if vocab_size < logits_row.shape[-1]:
+                    logits_row[vocab_size:] = -float("inf")
+                logp = spec_sampling.spec_transform(logits_row, past, spec)
+                logq = logq_rows[i][jj].to(device)
+                stats["acc"] += spec_sampling.shadow_overlaps(logp, logq).to(torch.float64)
+
+            stats["match"] += k
+            stats["positions"] += window
+            stats["windows"] += 1
+            if stats["windows"] % 50 == 0:
+                means = (stats["acc"] / stats["positions"]).tolist()
+                logger.info(
+                    "spec-shadow: windows=%d match=%.3f q_t1.0=%.3f q_t0.8=%.3f "
+                    "q_t0.6=%.3f q_shaped=%.3f",
+                    stats["windows"],
+                    stats["match"] / max(stats["positions"], 1),
+                    means[0], means[1], means[2], means[3],
+                )
 
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
@@ -1323,6 +1439,14 @@ class Generator:
 
                 accepted_lengths.append(accepted_length)
                 j += 1
+
+            # M1 shadow (EXL3_SPEC_SHADOW): observe-only. The legacy match-verify above has
+            # fully resolved the window; this estimates what exact speculative sampling
+            # would have accepted. Never touches job state or emitted tokens.
+            if _SPEC_SHADOW and draft_tokens is not None and self._spec_shadow_logq is not None:
+                self._spec_shadow_observe(
+                    batch_logits, draft_tokens, logit_mapping, accepted_lengths, rewound_jobs
+                )
 
         # Update the draft-confidence calibration with this round's verification outcomes (any
         # draft-model mode)
