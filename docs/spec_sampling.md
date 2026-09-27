@@ -141,3 +141,52 @@ Findings from re-reviewing against the sampler/draft code; all folded into the p
 
 Engineering detail: all acceptance comparisons in log space
 (`log u < min(0, logp - logq)`) to avoid overflow for tiny q(d).
+
+## 9. Review round 2 (M2 live debugging, 2026-09-28)
+
+First live run of M2 failed the rollout gates (acceptance 24-25%, decode -30% vs
+baseline). Instrumented debugging on spark-2 found the spec math and integration
+CORRECT and the loss entirely in window economics and metric interpretation:
+
+1. **The "acceptance half of theory" symptom was a metric mismatch, not a bug.**
+   The shadow's `m` and the API's `draft X/Y accepted` count accepted drafts over
+   DRAFTED positions (E[k]/w). Per-position acceptance a decays geometrically over the
+   window: m = a(1-a^w)/(w(1-a)). At the measured a ~ 0.65 with the forced full window
+   w=5, m = 0.33 — exactly what was observed. Per-position debug counters (d, p(d),
+   q(d), accept bit, one readback per window) showed acc = 0.700/0.645/0.623 vs
+   same-tensor theory ovl = 0.692/0.640/0.612: the accept test matches theory to
+   within noise, drafts really come from shaped q (E[q(d)] ~ 0.9 = q's collision
+   mass), and every round engages (no silent legacy fallback).
+2. **The decode loss was the full-window policy.** The M2 design bypassed the draft
+   calibrator, so every spec round drafted ALL `draft_num_tokens` (5) and verified 6
+   rows. Round cost on this box is dominated by a ~34 ms target-forward floor that is
+   nearly row-count-insensitive at small widths; baseline pays it over ~1.4
+   tokens/round, so spec must amortize it over MORE tokens, but E[k] = a(1-a^w)/(1-a)
+   saturates (a=0.65: w=3 -> 1.35, w=inf -> 1.86) while each extra position costs a
+   serial draft step (~1.3 ms) plus a forward row (~4 ms). Live sweep (quick bench):
+   w=5: 35/27, w=3: ~41/35, w=2: 49/40, w=1: ~45/43 vs baseline 50.9/42.1. Spec
+   rounds now cap the window at EXL3_SPEC_WINDOW (default 1).
+3. **Verify was restructured batched-optimistic.** Position i is only tested when
+   drafts 0..i-1 were accepted, so computing every position's p_i with past =
+   window-start past + d_0..d_{i-1} is EXACT for every tested position. The window
+   costs one transform launch batch plus one scalar readback instead of ~3 GPU->CPU
+   syncs per position (verify phase: 37 ms -> 4.3 ms per round; the rep penalty reads
+   only the last sustain+decay+1 past tokens, so only that tail is captured — sliced
+   indexing provably preserves the distance math, gated by a CPU test).
+4. **Shadow is now tested-basis.** It previously evaluated all window positions with
+   a past that included FUTURE resolved tokens, biasing the q estimates low (0.43-0.51
+   vs true 0.61-0.69) and making m and q incomparable. It now uses the window-start
+   prefix + accepted continuation — exactly the verifier's conditioning — and counts
+   only tested positions, so healthy spec must show m ~= q. Live: m=0.531 vs q=0.51,
+   m=0.466 vs q=0.49. The four-variant ranking still picks temp 0.6 + top_k 20 +
+   top_p 0.95; no acceptance upside left in q retuning (the draft head's intrinsic
+   overlap with p, ~0.5-0.65 by content, is the ceiling).
+5. **Acceptance is content-dependent, so engagement is per-job adaptive (§8.6).**
+   Single-stream spec only pays when a clears the break-even vs legacy drafting
+   (measured: prose a ~ 0.65 wins, code+thinking a ~ 0.5 loses ~15%). Jobs evaluate
+   their rolling E[accepted]/round every EXL3_SPEC_ADAPT_ROUNDS (16) spec rounds;
+   below EXL3_SPEC_MIN_ACC (0.55) the job returns to legacy argmax drafting and
+   re-probes after EXL3_SPEC_PROBE_ROUNDS (128) rounds. This keeps prose on spec
+   while code/thinking jobs converge back to baseline behavior automatically.
+6. Residual diagnostics (EXL3_SPEC_DEBUG accept-test counters, EXL3_SPEC_TIMING phase
+   timers) stay in the tree, default off.
