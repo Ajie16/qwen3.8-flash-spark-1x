@@ -1002,8 +1002,9 @@ class Generator:
         """
         M1 shadow mode (docs/spec_sampling.md §3): for every window position, compute the
         expected spec-sampling acceptance sum_x min(p(x), q(x)) under four q shapings, and
-        log running means next to the legacy match rate. Pure observation; runs after the
-        legacy match-verify has fully resolved the window and must not touch job state.
+        log per-interval and running-total means next to the legacy match rate. Pure
+        observation; runs after the legacy match-verify has fully resolved the window and
+        must not touch job state.
 
         The estimate is unbiased over the full window (§8.5): the target forward produced
         all window logit rows regardless of where legacy match-verify cut, so every draft
@@ -1019,6 +1020,9 @@ class Generator:
         if stats is None:
             stats = self._spec_shadow_stats = {
                 "windows": 0, "positions": 0, "match": 0, "acc": None,
+                # Same counters for the interval since the last log line, so workloads can
+                # be attributed per phase (code / prose / long context)
+                "i_windows": 0, "i_positions": 0, "i_match": 0, "i_acc": None,
             }
         device = batch_logits.device
         vocab_size = self.tokenizer.actual_vocab_size
@@ -1051,6 +1055,7 @@ class Generator:
 
             if stats["acc"] is None:
                 stats["acc"] = torch.zeros(4, dtype = torch.float64, device = device)
+                stats["i_acc"] = torch.zeros(4, dtype = torch.float64, device = device)
 
             seq = job.sequences[0]
             # The legacy verify already resolved this window: sequence_ids now holds the
@@ -1071,20 +1076,38 @@ class Generator:
                     logits_row[vocab_size:] = -float("inf")
                 logp = spec_sampling.spec_transform(logits_row, past, spec)
                 logq = logq_rows[i][jj].to(device)
-                stats["acc"] += spec_sampling.shadow_overlaps(logp, logq).to(torch.float64)
+                ov = spec_sampling.shadow_overlaps(logp, logq).to(torch.float64)
+                stats["acc"] += ov
+                stats["i_acc"] += ov
 
             stats["match"] += k
             stats["positions"] += window
             stats["windows"] += 1
+            stats["i_match"] += k
+            stats["i_positions"] += window
+            stats["i_windows"] += 1
             if stats["windows"] % 50 == 0:
-                means = (stats["acc"] / stats["positions"]).tolist()
+                # Means are per-position (denominator = draft positions, not windows),
+                # same basis for the interval and the running total; one sync for both
+                vals = torch.cat((
+                    stats["i_acc"] / max(stats["i_positions"], 1),
+                    stats["acc"] / max(stats["positions"], 1),
+                )).tolist()
                 logger.info(
-                    "spec-shadow: windows=%d match=%.3f q_t1.0=%.3f q_t0.8=%.3f "
-                    "q_t0.6=%.3f q_shaped=%.3f",
+                    "spec-shadow: [interval] windows=%d match=%.3f q_t1.0=%.3f q_t0.8=%.3f "
+                    "q_t0.6=%.3f q_shaped=%.3f | [total] windows=%d match=%.3f q_t1.0=%.3f "
+                    "q_t0.8=%.3f q_t0.6=%.3f q_shaped=%.3f",
+                    stats["i_windows"],
+                    stats["i_match"] / max(stats["i_positions"], 1),
+                    vals[0], vals[1], vals[2], vals[3],
                     stats["windows"],
                     stats["match"] / max(stats["positions"], 1),
-                    means[0], means[1], means[2], means[3],
+                    vals[4], vals[5], vals[6], vals[7],
                 )
+                stats["i_windows"] = 0
+                stats["i_positions"] = 0
+                stats["i_match"] = 0
+                stats["i_acc"].zero_()
 
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
