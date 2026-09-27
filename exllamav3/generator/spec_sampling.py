@@ -169,17 +169,19 @@ def _truncate(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
     and threshold semantics as the fused kernel's histogram select): top_k keeps exactly
     the K highest logits; top_p then normalizes over the kept set and keeps sorted
     positions while the cumulative probability stays <= top_p (position 0 always kept).
+    Works on (..., vocab) — 1D rows and batched row stacks alike.
     """
     vocab = logits.shape[-1]
     if 0 < top_k < vocab:
-        _, idx = torch.sort(logits, dim = -1, descending = True)
-        logits = logits.clone()
-        logits[idx[top_k:]] = -float("inf")
+        s_logits, s_idx = torch.sort(logits, dim = -1, descending = True)
+        kept = torch.full_like(s_logits, -float("inf"))
+        kept[..., :top_k] = s_logits[..., :top_k]
+        logits = torch.full_like(logits, -float("inf")).scatter(-1, s_idx, kept)
     if 0.0 < top_p < 1.0:
         s_logits, s_idx = torch.sort(logits, dim = -1, descending = True)
         probs = torch.softmax(s_logits, dim = -1)
         keep = probs.cumsum(dim = -1) <= top_p
-        keep[0] = True
+        keep[..., 0] = True
         s_logits = torch.where(keep, s_logits, torch.full_like(s_logits, -float("inf")))
         logits = torch.full_like(logits, -float("inf")).scatter(-1, s_idx, s_logits)
     return logits
@@ -199,6 +201,34 @@ def spec_transform(
     logits = logits_row.float().clone()
     if spec.rep_p != 1.0 and past_ids is not None and past_ids.numel():
         logits = _apply_rep_penalty(logits, past_ids.to(logits.device), spec)
+    if spec.temp_first and spec.temperature != 1.0:
+        logits = logits / spec.temperature
+    logits = _truncate(logits, spec.top_k, spec.top_p)
+    if not spec.temp_first and spec.temperature != 1.0:
+        logits = logits / spec.temperature
+    return torch.log_softmax(logits, dim = -1)
+
+
+def spec_transform_batched(
+    logits_rows: torch.Tensor,
+    pasts: list,
+    spec: SpecTransform,
+) -> torch.Tensor:
+    """
+    Batched spec_transform: (w, vocab) logits rows -> (w, vocab) fp32 log-probs. pasts[i]
+    is the past-ids row for position i (None disables the penalty for that row). The
+    rep penalty is applied per row (its factors depend on each row's own past length);
+    temperature and the top_k/top_p truncation batch over rows. Launch-only, no syncs —
+    the spec verify path builds all rows optimistically and reads back once per window.
+    """
+    logits = logits_rows.float()
+    if spec.rep_p != 1.0:
+        dev = logits.device
+        logits = torch.stack([
+            _apply_rep_penalty(logits[i], p.to(dev), spec)
+            if p is not None and p.numel() else logits[i]
+            for i, p in enumerate(pasts)
+        ])
     if spec.temp_first and spec.temperature != 1.0:
         logits = logits / spec.temperature
     logits = _truncate(logits, spec.top_k, spec.top_p)
