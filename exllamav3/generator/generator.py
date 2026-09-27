@@ -275,6 +275,7 @@ class Generator:
         # verified (list of (batch, head_n) fp32 tensors), plus process-level counters
         self._spec_shadow_logq = None
         self._spec_shadow_stats = None
+        self._spec_shadow_errors = 0
         if draft_confidence is None:
             draft_confidence = float(_os.environ.get("EXL3_DRAFT_CONFIDENCE", "0.4"))
         self.draft_confidence = draft_confidence
@@ -999,6 +1000,30 @@ class Generator:
         accepted_lengths: list,
         rewound_jobs: set,
     ):
+        # Shadow mode is observe-only: a measurement bug must never kill generation, so any
+        # exception is contained here, logged with rate limiting, and the window skipped
+        try:
+            self._spec_shadow_observe_inner(
+                batch_logits, draft_tokens, logit_mapping, accepted_lengths, rewound_jobs
+            )
+        except Exception as e:
+            n = self._spec_shadow_errors + 1
+            self._spec_shadow_errors = n
+            if n == 1 or n % 100 == 0:
+                logger.warning(
+                    "spec-shadow: observation failed (%d total); skipping window: %s: %s",
+                    n, type(e).__name__, e,
+                )
+
+
+    def _spec_shadow_observe_inner(
+        self,
+        batch_logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        logit_mapping: list,
+        accepted_lengths: list,
+        rewound_jobs: set,
+    ):
         """
         M1 shadow mode (docs/spec_sampling.md §3): for every window position, compute the
         expected spec-sampling acceptance sum_x min(p(x), q(x)) under four q shapings, and
@@ -1065,21 +1090,28 @@ class Generator:
             # past the legacy cut no real accepted prefix exists, so approximate it with
             # the draft continuation (rep-penalty past-ids only — a measurement
             # approximation, not a behavior change).
+            # sequence_ids.torch() is (1, seq_len) — the same (1, n) shape the live sampler
+            # receives as past_ids — so keep the draft continuation 2D as well
             base_ids = seq.sequence_ids.torch().to(device, non_blocking = True)
+            if base_ids.dim() == 1:
+                base_ids = base_ids.unsqueeze(0)
             k = accepted_length - 1
-            drafts = draft_tokens[jj, :window].to(device, non_blocking = True)
+            drafts = draft_tokens[jj:jj + 1, :window].to(device, non_blocking = True)
 
+            # Accumulate per job and commit to the shared counters only after the position
+            # loop completes, so a contained exception mid-window can't skew the means
+            job_acc = torch.zeros(4, dtype = torch.float64, device = device)
             for i in range(window):
-                past = base_ids if i <= k else torch.cat((base_ids, drafts[k:i]))
+                past = base_ids if i <= k else torch.cat((base_ids, drafts[:, k:i]), dim = -1)
                 logits_row = batch_logits[a, i].float()
                 if vocab_size < logits_row.shape[-1]:
                     logits_row[vocab_size:] = -float("inf")
                 logp = spec_sampling.spec_transform(logits_row, past, spec)
                 logq = logq_rows[i][jj].to(device)
-                ov = spec_sampling.shadow_overlaps(logp, logq).to(torch.float64)
-                stats["acc"] += ov
-                stats["i_acc"] += ov
+                job_acc += spec_sampling.shadow_overlaps(logp, logq).to(torch.float64)
 
+            stats["acc"] += job_acc
+            stats["i_acc"] += job_acc
             stats["match"] += k
             stats["positions"] += window
             stats["windows"] += 1

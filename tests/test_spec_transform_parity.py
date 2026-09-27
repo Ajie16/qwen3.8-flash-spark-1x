@@ -227,10 +227,85 @@ def test_transform_deterministic():
     print("deterministic transform checks ok")
 
 
+def test_shadow_observe_smoke():
+    # Drives Generator._spec_shadow_observe with stub jobs. Covers the two failure modes
+    # seen outside the stub world: (a) sequence_ids.torch() is (1, seq_len) — 2D, the same
+    # shape the live sampler gets as past_ids — and the draft continuation must align with
+    # it for positions past the legacy cut; (b) any exception inside the observation must
+    # be contained (rate-limited warning, window skipped), never propagated into
+    # generation.
+    import logging
+    from types import SimpleNamespace
+    from exllamav3.generator.generator import Generator, logger
+    from exllamav3.generator.sampler.custom import SS_Fused
+
+    infos, warnings = [], []
+    class H(logging.Handler):
+        def emit(self, r):
+            (warnings if r.levelno >= logging.WARNING else infos).append(r.getMessage())
+    h = H()
+    logger.addHandler(h)
+    logger.setLevel(logging.INFO)
+    try:
+        vocab, window = 64, 3
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+        def make_job(seq_ids_obj):
+            return SimpleNamespace(
+                sequences = [SimpleNamespace(sequence_ids = seq_ids_obj)],
+                filters = [], forced_ids = None, return_probs = False, return_top_tokens = 0,
+                device_logit_mask = None, new_tokens = 1,
+                sampler = SimpleNamespace(steps = [SS_Fused(SS_Fused.MODE_SAMPLE, 1.0)]),
+            )
+
+        class FakeSeqIds:
+            def torch(self): return torch.zeros((1, 10), dtype = torch.long)  # real 2D shape
+
+        g = SimpleNamespace(
+            active_jobs = [make_job(FakeSeqIds())],
+            _spec_shadow_stats = None, _spec_shadow_errors = 0,
+            tokenizer = SimpleNamespace(actual_vocab_size = vocab),
+        )
+        # The real Generator has this as a method; the wrapper calls it on self
+        g._spec_shadow_observe_inner = Generator._spec_shadow_observe_inner.__get__(g)
+        batch_logits = torch.randn(1, window + 1, vocab, device = device)
+        draft_tokens = torch.zeros(1, window, dtype = torch.long)
+        # accepted_length = 1 -> k = 0, so positions 1..window-1 take the cat path
+        for _ in range(120):
+            g._spec_shadow_logq = [
+                torch.log_softmax(torch.randn(1, 32, device = device), dim = -1)
+                for _ in range(window)
+            ]
+            Generator._spec_shadow_observe(g, batch_logits, draft_tokens, [0, 1], [1], set())
+        assert len(infos) == 2, infos
+        assert infos[0].startswith("spec-shadow: [interval] windows=50 "), infos[0]
+        assert "| [total] windows=50 " in infos[0]
+        assert "| [total] windows=100 " in infos[1]
+
+        # Exception containment: a job whose state access raises is skipped with a
+        # rate-limited warning; nothing propagates, stats are untouched
+        class BadSeqIds:
+            def torch(self): raise RuntimeError("boom")
+        g.active_jobs = [make_job(BadSeqIds())]
+        g._spec_shadow_logq = [
+            torch.log_softmax(torch.randn(1, 32, device = device), dim = -1)
+            for _ in range(window)
+        ]
+        stats_before = dict(g._spec_shadow_stats)
+        Generator._spec_shadow_observe(g, batch_logits, draft_tokens, [0, 1], [1], set())
+        assert g._spec_shadow_errors == 1
+        assert len(warnings) == 1 and "spec-shadow" in warnings[0] and "boom" in warnings[0], warnings
+        assert g._spec_shadow_stats["windows"] == stats_before["windows"]
+    finally:
+        logger.removeHandler(h)
+    print("shadow observe smoke ok")
+
+
 if __name__ == "__main__":
     test_transform_deterministic()
     test_extract_spec_fused_matches_discrete()
     test_extract_spec_unsupported()
+    test_shadow_observe_smoke()
     test_parity_deployed_preset()
     test_parity_temp_last()
     test_parity_temperature_only()
