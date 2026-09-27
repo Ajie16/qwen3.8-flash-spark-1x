@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+import os as _os
 import torch
 from dataclasses import dataclass
 from .sampler.custom import (
@@ -15,9 +16,9 @@ from .sampler.custom import (
 
 """
 Exact speculative sampling (design: docs/spec_sampling.md) — pure, generator-state-free
-helpers. M1 uses them ONLY for shadow-mode measurement (EXL3_SPEC_SHADOW=1): the legacy
-match-verify path executes unchanged while these functions estimate what the acceptance
-rate would be under exact speculative sampling, E[sum_x min(p(x), q(x))].
+helpers. M1 uses them for shadow-mode measurement (EXL3_SPEC_SHADOW=1); M2 uses them for
+the real spec path (EXL3_SPEC_SAMPLING=1): drafts sampled from the shaped q, per-position
+acceptance min(1, p/q) and rejection resampling from renorm((p - q)+), all in log space.
 
 spec_transform() mirrors the executed sampler stack
 
@@ -29,9 +30,15 @@ the fused CUDA kernel:
 
 - top_k truncates exactly K tokens in sort order; the fused kernel keeps every token tied
   exactly at the cutoff
-- rep-penalty factors reduce with torch index_reduce("amax") instead of the kernel's
+- rep-penalty factors reduce with torch scatter_reduce("amax") instead of the kernel's
   shared-memory atomicMax
 """
+
+# Draft distribution shaping (M1 shadow winner on live traffic: q_shaped edged out
+# q_t0.6/q_t0.8/q_t1.0). Exactness holds for any q; these only affect acceptance rate.
+SPEC_Q_TEMP = float(_os.environ.get("EXL3_SPEC_Q_TEMP", "0.6"))
+SPEC_Q_TOP_K = 20
+SPEC_Q_TOP_P = 0.95
 
 
 @dataclass
@@ -232,3 +239,71 @@ def shadow_overlaps(logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
     lq = shape_q_logprobs(logq, 0.6, 20, 0.95)
     ovs.append(torch.minimum(p, lq.exp()).sum())
     return torch.stack(ovs)
+
+
+def job_spec(job) -> SpecTransform | None:
+    """
+    M2 spec-path eligibility for one job (design §4): the job's sampler stack must be in
+    the supported subset AND nothing may make the per-position distribution depend on
+    state the spec path does not model (filters, forced tokens, logit masks, prob
+    exports, multi-sequence/CFG, token healing). Returns the transform, or None to keep
+    the job on the legacy match-verify path.
+    """
+    if (
+        len(job.sequences) != 1 or
+        job.filters or
+        job.forced_ids is not None or
+        job.return_probs or
+        job.return_top_tokens > 0 or
+        job.device_logit_mask is not None or
+        job.new_tokens < 0
+    ):
+        return None
+    return extract_spec(job.sampler)
+
+
+def shaped_q(logq: torch.Tensor) -> torch.Tensor:
+    """
+    The actual draft distribution q used by the spec path (M1-measured shaping: temp 0.6
+    + the draft head's own top_k=20/top_p=0.95 truncation). Drafting samples from this
+    and verification must test against exactly the same q.
+    """
+    return shape_q_logprobs(logq, SPEC_Q_TEMP, SPEC_Q_TOP_K, SPEC_Q_TOP_P)
+
+
+def q_sample(logq_row: torch.Tensor, seed: int) -> torch.Tensor:
+    """
+    Draw one draft token from the shaped q (deterministic given the seed; the caller
+    seeds from job.rng so runs stay reproducible per job seed).
+    """
+    probs = shaped_q(logq_row).exp()
+    gen = torch.Generator(device = logq_row.device)
+    gen.manual_seed(seed)
+    return torch.multinomial(probs, 1, generator = gen)
+
+
+def spec_accept(logu: float, logpd: float, logqd: float) -> bool:
+    """
+    Acceptance test in log space (design §8: avoids overflow for tiny q(d)): accept the
+    draft iff log u < min(0, logp(d) - logq(d)). q(d) == 0 (draft outside the pruned-head
+    slice) is passed as logqd = -inf and always accepts; p(d) == 0 gives logpd = -inf and
+    always rejects.
+    """
+    return logu < min(0.0, logpd - logqd)
+
+
+def spec_residual_probs(logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
+    """
+    Rejection resampling distribution renorm((p - q)+) over the full vocabulary. q is
+    zero outside the pruned-head slice, so the residual there equals p without
+    materializing q beyond the slice. Falls back to p in the fp-degenerate p == q case
+    (unreachable via rejection in exact math, since acceptance is then 1).
+    """
+    n2 = logq.shape[-1]
+    p = logp.exp()
+    r = p.clone()
+    r[:n2] = (p[:n2] - logq.exp()).clamp_(min = 0.0)
+    s = r.sum()
+    if s <= 0.0:
+        return p
+    return r / s
