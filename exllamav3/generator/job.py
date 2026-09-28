@@ -1173,7 +1173,7 @@ class Job:
             self.held_probs = SeqTensor((1, 0), dtype = torch.float, seq_dim = -1)
             self.held_logits = SeqTensor((1, 0, self.generator.padded_vocab_size), dtype = torch.float, seq_dim = 1)
             self.full_completion = ""
-            self.sam = None if not generator.ngram_match_min else ext.BC_SAM()
+            self.sam = None if not (generator.ngram_match_min or generator.hybrid_ngram) else ext.BC_SAM()
 
         self.time_enqueue = time.time()
 
@@ -1647,16 +1647,33 @@ class Job:
         """
         Return speculative draft tokens from the suffix-array n-gram matcher.
         """
+        draft, _ = self.probe_ngram_draft(draft_length, self.generator.ngram_match_min)
+        return draft
+
+
+    def probe_ngram_draft(self, draft_length: int, min_match: int):
+        """
+        Hybrid-mode ngram probe (EXL3_HYBRID_NGRAM): update the SAM with the job's new
+        history and return ((1, w) continuation draft, match_len). The draft is empty
+        when the longest suffix repeat is shorter than min_match; its length is whatever
+        continuation remains after the match, capped at draft_length.
+
+        accept_tensor consumes history incrementally — it tracks its own offset into the
+        sequence and rebuilds the automaton when a rewind shrinks it — so intermittent
+        probing (ngram this round, MTP the next) is exact: each call consumes whatever
+        tokens arrived since the previous one and matches against the full prefix.
+        """
         assert self.sam
 
         # Update SAM with current history and find longest suffix
         seq = self.sequences[0].sequence_ids.torch()
         beg, end = self.sam.accept_tensor(seq)
+        match_len = end - beg
 
         # Grab continuation after longest match or return empty seq
-        if end - beg >= self.generator.ngram_match_min:
+        if match_len >= min_match:
             draft = seq[:, end : end + draft_length]
         else:
             draft = torch.empty((1, 0), dtype = torch.long)
 
-        return draft
+        return draft, match_len

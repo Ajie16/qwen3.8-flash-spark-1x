@@ -57,6 +57,40 @@ _SPEC_MIN_ACC = float(_os.environ.get("EXL3_SPEC_MIN_ACC", "0.55"))
 _SPEC_ADAPT_ROUNDS = max(1, int(_os.environ.get("EXL3_SPEC_ADAPT_ROUNDS", "16")))
 _SPEC_PROBE_ROUNDS = max(1, int(_os.environ.get("EXL3_SPEC_PROBE_ROUNDS", "128")))
 
+# M3 hybrid ngram+MTP drafting: per job and round, draft from the suffix-automaton
+# continuation when the longest suffix repeat reaches EXL3_NGRAM_MIN_MATCH and has
+# continuation left to copy (near-free, and long repeats in code/markup accept in long
+# runs), else fall back to the MTP draft. Both sources share the legacy match-verify.
+# Default off = master behavior; the mutually exclusive pure-ngram mode
+# (ngram_match_min) is untouched
+_HYBRID_NGRAM = _os.environ.get("EXL3_HYBRID_NGRAM", "0") != "0"
+_HYBRID_MIN_MATCH = max(1, int(_os.environ.get("EXL3_NGRAM_MIN_MATCH", "8")))
+_HYBRID_MAX_DRAFT = max(1, int(_os.environ.get("EXL3_NGRAM_MAX_DRAFT", "16")))
+_HYBRID_STATS = _os.environ.get("EXL3_HYBRID_STATS", "0") != "0"
+# Padding token for rows drafted shorter than the round's combined window. A pad
+# position verifies like any draft position under match-verify: it accepts iff the
+# target happens to sample the pad token there (exact, just unlikely) and rejects the
+# remainder otherwise
+_HYBRID_PAD_TOKEN = 0
+
+
+def _hybrid_pad_rows(drafts: list, pad_token: int = _HYBRID_PAD_TOKEN) -> torch.Tensor:
+    """
+    Stack per-row (1, w_i) draft tensors of varying widths into one (rows, max_width)
+    tensor, padding short or missing (None) rows with pad_token.
+    """
+    width = 0
+    for d in drafts:
+        if d is not None:
+            width = max(width, d.shape[-1])
+    assert width >= 1, "hybrid draft assembly needs at least one non-empty row"
+    out = torch.full((len(drafts), width), pad_token, dtype = torch.long)
+    for r, d in enumerate(drafts):
+        if d is not None and d.shape[-1]:
+            out[r, :d.shape[-1]] = d[0]
+    return out
+
+
 class Generator:
 
     def __init__(
@@ -286,10 +320,47 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        # M3 hybrid ngram+MTP drafting (EXL3_HYBRID_NGRAM). Requires the MTP drafter:
+        # ngram rounds rely on iterate_gen's MTP carry maintenance (target-hidden export
+        # is requested whenever a draft model is attached) so drafting can resume after
+        # any ngram streak. Incompatible with spec drafting — an ngram round has no
+        # draft q, and mixing per-row verify semantics mid-round leaves neither the
+        # M2-exact nor the legacy distribution — so spec sampling stays suppressed
+        # whenever hybrid is on (legacy match-verify throughout, i.e. baseline outputs)
+        self.hybrid_ngram = False
+        if _HYBRID_NGRAM:
+            if self.mtp_draft:
+                self.hybrid_ngram = True
+                if _SPEC_SAMPLING:
+                    logger.warning(
+                        "EXL3_HYBRID_NGRAM: EXL3_SPEC_SAMPLING suppressed (ngram rounds "
+                        "have no draft q; hybrid verifies legacy throughout)"
+                    )
+            else:
+                logger.warning(
+                    "EXL3_HYBRID_NGRAM requires an MTP draft model; ignoring "
+                    "(pure-ngram mode via ngram_match_min is unchanged)"
+                )
+        self.hybrid_ngram_min_match = _HYBRID_MIN_MATCH
+        self.hybrid_ngram_max = _HYBRID_MAX_DRAFT
+        # Per-round hybrid state: row sources for accounting, ngram rows for the
+        # calibrator skip, spec suppression flag for mixed rounds
+        self._hybrid_round_src = None
+        self._hybrid_ngram_jobs = set()
+        self._hybrid_suppress_spec = False
+        self._hybrid_stats = {
+            "rounds": 0, "ng_rounds": 0,
+            "ng_drafted": 0, "ng_accepted": 0,
+            "mtp_drafted": 0, "mtp_accepted": 0,
+        }
         # DFlash writes its full native block even when verification is shortened.
         self.draft_reserve_tokens = self.num_draft_tokens
         if self.dflash_draft:
             self.draft_reserve_tokens = max(self.num_draft_tokens, self.draft_model.config.block_size - 1)
+        if self.hybrid_ngram:
+            # Ngram drafts run past num_draft_tokens; the job token budget must reserve
+            # page space for the wider window
+            self.draft_reserve_tokens = max(self.draft_reserve_tokens, self.hybrid_ngram_max)
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -593,7 +664,10 @@ class Generator:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
             elif self.mtp_draft:
-                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                if self.hybrid_ngram:
+                    draft_tokens = self.iterate_hybrid_gen(results)
+                else:
+                    draft_tokens = self.iterate_draftmodel_mtp_gen(results)
                 self.iterate_gen(results, draft_tokens)
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results)
@@ -818,7 +892,10 @@ class Generator:
         # argmax drafts and legacy match-verify. Stored for the verify loop, whose batch
         # rows follow the same order.
         specs = None
-        if _SPEC_SAMPLING:
+        # Hybrid rounds with any ngram row suppress spec drafting so every row verifies
+        # with the same legacy semantics its draft was produced under (ngram drafts have
+        # no q to verify against)
+        if _SPEC_SAMPLING and not self._hybrid_suppress_spec:
             from . import spec_sampling
             specs = [spec_sampling.job_spec(job) for job in row_jobs]
             if _SPEC_ADAPTIVE:
@@ -1080,6 +1157,152 @@ class Generator:
         # Trim to minimum length in batch
         draft_ids = torch.cat([d[:, :min_len] for d in draft_ids], dim = 0)
         return draft_ids
+
+
+    def iterate_hybrid_gen(self, results: list):
+        """
+        M3 hybrid ngram+MTP drafting (EXL3_HYBRID_NGRAM). Every round, each job drafts
+        from its suffix-automaton continuation when the automaton finds a repeat of at
+        least EXL3_NGRAM_MIN_MATCH tokens with continuation left to copy, and falls back
+        to the MTP draft otherwise. Both sources share the legacy match-verify in
+        iterate_gen, so outputs keep baseline (non-spec) semantics.
+
+        MTP state alignment — why ngram rounds are safe mid-stream: the MTP carry
+        (job.mtp_last_hidden) and the draft KV are both maintained by iterate_gen from
+        the TARGET forward, not by the drafter. draft_verifier_params are added to the
+        target forward whenever a draft model is attached (regardless of the draft
+        source), and the post-verify draft_model.prefill writes the accepted tokens —
+        whoever proposed them — into the draft cache, then re-pairs mtp_last_hidden with
+        the last accepted position. An ngram round therefore advances the MTP state
+        exactly like an MTP round, and MTP drafting resumes on any later round from a
+        consistent carry. The drafter's own speculative KV positions are position-indexed
+        scratch rewritten every round, so the skipped draft forward leaves nothing stale.
+        """
+        self._hybrid_round_src = {}
+        self._hybrid_ngram_jobs = set()
+        self._hybrid_suppress_spec = False
+
+        # Probe every prefill-done job's SAM. accept_tensor consumes the job's history
+        # incrementally (it tracks its own offset and rebuilds on rewind), so probing
+        # every round keeps the automaton current across arbitrary ngram/MTP
+        # interleavings; a probe that doesn't qualify still did that bookkeeping.
+        ordered = [job for job in self.active_jobs if job.is_prefill_done()]
+        if not ordered:
+            self._hybrid_round_src = None
+            return None
+        candidates = {}
+        for job in ordered:
+            assert len(job.sequences) == 1, \
+                "Hybrid ngram drafting does not support CFG/multi-sequence jobs"
+            if getattr(job, "sam", None) is None:
+                continue
+            draft, _match_len = job.probe_ngram_draft(
+                self.hybrid_ngram_max, self.hybrid_ngram_min_match
+            )
+            if draft.shape[-1] >= 1:
+                candidates[id(job)] = draft
+
+        st = self._hybrid_stats
+        st["rounds"] += 1
+
+        if not candidates:
+            # Pure MTP round — identical to the un-hybrid path
+            draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+            if draft_tokens is not None:
+                w = draft_tokens.shape[-1]
+                for job in ordered:
+                    self._hybrid_round_src[id(job)] = ("mtp", w)
+            return draft_tokens
+
+        st["ng_rounds"] += 1
+
+        if len(candidates) < len(ordered):
+            # Mixed round: run the regular full-batch MTP draft, then overwrite the ngram
+            # rows. Sub-batching the drafter would save one small forward but desync the
+            # confidence calibrator's and shadow's row maps; the draft forward is ~4 ms
+            # against a ~34 ms target-forward floor. Spec drafting is suppressed for the
+            # round so every row is verified with the same legacy semantics its draft was
+            # produced under (an ngram draft has no q; a q-sampled MTP row verified
+            # hard-match would leave both the M2-exact and the legacy distributions).
+            self._hybrid_suppress_spec = True
+            try:
+                mtp_tokens = self.iterate_draftmodel_mtp_gen(results)
+            finally:
+                self._hybrid_suppress_spec = False
+            # The shadow's logq rows describe the MTP drafts just discarded on the ngram
+            # rows; pairing them with the overwritten drafts would corrupt the estimate
+            self._spec_shadow_logq = None
+            self._spec_draft_specs = None
+            drafts = []
+            for r, job in enumerate(ordered):
+                cand = candidates.get(id(job))
+                if cand is not None:
+                    drafts.append(cand)
+                    self._hybrid_round_src[id(job)] = ("ngram", cand.shape[-1])
+                    self._hybrid_ngram_jobs.add(id(job))
+                elif mtp_tokens is not None:
+                    drafts.append(mtp_tokens[r:r + 1])
+                    self._hybrid_round_src[id(job)] = ("mtp", mtp_tokens.shape[-1])
+                else:
+                    # No MTP carry this round (e.g. first round after enqueue): an
+                    # all-pad row verifies as an immediate mismatch, i.e. one plain token
+                    drafts.append(None)
+            return _hybrid_pad_rows(drafts)
+
+        # Pure ngram round: skip the MTP draft forward entirely (the common case on
+        # repetitive content). Clear the per-round draft-model state so the shadow and
+        # the calibrator never consume stale rows from an earlier MTP round.
+        self._spec_shadow_logq = None
+        self._spec_draft_specs = None
+        self._draft_conf_round = None
+        drafts = []
+        for job in ordered:
+            cand = candidates[id(job)]
+            drafts.append(cand)
+            self._hybrid_round_src[id(job)] = ("ngram", cand.shape[-1])
+            self._hybrid_ngram_jobs.add(id(job))
+        return _hybrid_pad_rows(drafts)
+
+
+    def _hybrid_account(self, logit_mapping, accepted_lengths, rewound_jobs):
+        """
+        Per-source drafted/accepted accounting for EXL3_HYBRID_STATS, hooked after the
+        verify loop where accepted_lengths is complete. Abandoned (rewound) windows are
+        skipped, as in draft_stats.
+        """
+        src = self._hybrid_round_src
+        self._hybrid_round_src = None
+        if not src:
+            return
+        st = self._hybrid_stats
+        row = 0
+        for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+            if a == b:
+                continue
+            accepted_length = accepted_lengths[row]
+            row += 1
+            s = src.get(id(job))
+            if s is None or id(job) in rewound_jobs:
+                continue
+            kind, width = s
+            # accepted_length - 1 can exceed the row's real draft width only through a
+            # lucky pad-token match; clamp so pad positions never count as drafted
+            acc = max(0, min(accepted_length - 1, width))
+            if kind == "ngram":
+                st["ng_drafted"] += width
+                st["ng_accepted"] += acc
+            else:
+                st["mtp_drafted"] += width
+                st["mtp_accepted"] += acc
+        if _HYBRID_STATS and st["rounds"] % 50 == 0:
+            # Short single line: TabbyAPI wraps log records at console width
+            logger.info(
+                "hybrid-stats r=%d ng=%.2f na=%.3f ma=%.3f",
+                st["rounds"],
+                st["ng_rounds"] / st["rounds"],
+                st["ng_accepted"] / max(st["ng_drafted"], 1),
+                st["mtp_accepted"] / max(st["mtp_drafted"], 1),
+            )
 
 
     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
@@ -1912,6 +2135,12 @@ class Generator:
                 torch.cuda.synchronize()
                 self._spec_timers()["verify"] += time.perf_counter() - _t0v
 
+            # M3 hybrid (EXL3_HYBRID_NGRAM): per-source drafted/accepted accounting.
+            # Runs before the shadow so its per-round source map is consumed regardless
+            # of what the shadow does
+            if self._hybrid_round_src is not None:
+                self._hybrid_account(logit_mapping, accepted_lengths, rewound_jobs)
+
             # M1 shadow (EXL3_SPEC_SHADOW): observe-only. The legacy match-verify above has
             # fully resolved the window; this estimates what exact speculative sampling
             # would have accepted. Never touches job state or emitted tokens.
@@ -1938,7 +2167,17 @@ class Generator:
                 row += 1
                 if id(job) in rewound_jobs:
                     continue
+                # Hybrid rounds: ngram rows overwrote this row's MTP drafts before
+                # verify, so its conf/ids pairs were never tested — labeling them would
+                # drift the calibrator
+                if id(job) in self._hybrid_ngram_jobs:
+                    continue
                 a = accepted_length - 1
+                # Hybrid mixed rounds pad rows past their real draft width; labels exist
+                # only for real drafted positions (a pad-token acceptance is a real
+                # accepted token but has no conf entry)
+                if self.hybrid_ngram:
+                    a = min(a, conf.shape[-1])
                 for i in range(a):
                     cal.add_label(conf[i].item(), True)
                 if a < conf.shape[-1]:
