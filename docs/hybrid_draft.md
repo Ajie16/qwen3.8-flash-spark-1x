@@ -16,7 +16,7 @@ model) is untouched.
 |---|---|---|
 | `EXL3_HYBRID_NGRAM` | 0 | master switch; requires the MTP drafter |
 | `EXL3_NGRAM_MIN_MATCH` | 8 | minimum suffix-repeat length to engage ngram |
-| `EXL3_NGRAM_MAX_DRAFT` | 16 | max continuation tokens drafted per ngram round |
+| `EXL3_NGRAM_MAX_DRAFT` | 7 | max continuation tokens per ngram round. Do not raise past 7: the target forward switches kernels at q_len > 8 and decode collapses (measured on GB10: w=7 107 tok/s, w=8 46 tok/s on exact-repeat content) |
 | `EXL3_HYBRID_STATS` | 0 | `hybrid-stats r=.. ng=.. na=.. ma=..` every 50 rounds: ngram round share, per-position ngram acceptance, per-position MTP acceptance |
 | `EXL3_NGRAM_ADAPTIVE` | 1 | per-job backoff: disengage ngram below `EXL3_NGRAM_MIN_ACC` acceptance, re-probe later |
 | `EXL3_NGRAM_MIN_ACC` | 0.25 | per-position ngram acceptance floor (0.25 × 16-wide window ≈ the MTP round's yield) |

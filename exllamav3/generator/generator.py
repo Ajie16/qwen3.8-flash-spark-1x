@@ -65,7 +65,10 @@ _SPEC_PROBE_ROUNDS = max(1, int(_os.environ.get("EXL3_SPEC_PROBE_ROUNDS", "128")
 # (ngram_match_min) is untouched
 _HYBRID_NGRAM = _os.environ.get("EXL3_HYBRID_NGRAM", "0") != "0"
 _HYBRID_MIN_MATCH = max(1, int(_os.environ.get("EXL3_NGRAM_MIN_MATCH", "8")))
-_HYBRID_MAX_DRAFT = max(1, int(_os.environ.get("EXL3_NGRAM_MAX_DRAFT", "16")))
+# 7, not more: the target stack switches forward kernels at q_len > 8 (measured on
+# GB10: w=7 ~107 tok/s on exact-repeat content, w=8 collapses to ~46), and the legacy
+# serial verify charges per window position regardless
+_HYBRID_MAX_DRAFT = max(1, int(_os.environ.get("EXL3_NGRAM_MAX_DRAFT", "7")))
 _HYBRID_STATS = _os.environ.get("EXL3_HYBRID_STATS", "0") != "0"
 # Per-job adaptive ngram backoff: a long suffix repeat whose continuation diverges
 # (structural repeats with varying content, e.g. JSON records) wastes the wide window.
