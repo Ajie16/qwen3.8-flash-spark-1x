@@ -343,6 +343,19 @@ class Generator:
                 )
         self.hybrid_ngram_min_match = _HYBRID_MIN_MATCH
         self.hybrid_ngram_max = _HYBRID_MAX_DRAFT
+        if self.hybrid_ngram:
+            # Recurrent state history (GDN conv/state buffers) is sized by the frontend
+            # from the draft window (tabbyAPI: max_history = draft_num_tokens). A wider
+            # ngram window would overflow it, so clamp to what the cache can verify;
+            # the frontend should size max_history >= EXL3_NGRAM_MAX_DRAFT instead
+            max_hist = getattr(self.cache, "max_history", 0)
+            if max_hist and self.hybrid_ngram_max > max_hist:
+                logger.warning(
+                    "EXL3_HYBRID_NGRAM: cache max_history (%d) < EXL3_NGRAM_MAX_DRAFT "
+                    "(%d); clamping ngram draft width (recurrent state history)",
+                    max_hist, self.hybrid_ngram_max,
+                )
+                self.hybrid_ngram_max = max_hist
         # Per-round hybrid state: row sources for accounting, ngram rows for the
         # calibrator skip, spec suppression flag for mixed rounds
         self._hybrid_round_src = None
