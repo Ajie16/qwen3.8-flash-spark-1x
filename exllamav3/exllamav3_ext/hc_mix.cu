@@ -6,6 +6,8 @@
 #include "util.cuh"
 #include "graph.cuh"
 #include <cstdlib>
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
 
 /*
 
@@ -1576,6 +1578,270 @@ void gr_mix
     cuda_check(cudaPeekAtLastError());
 }
 
+
+// ---------------------------------------------------------------------------
+// Fused dots+finalize, gated by EXL3_GR_TUNED=1. One cooperative launch:
+// warp-per-(r, j, h) dots, L2 prefetch of the up_q columns between phases,
+// grid.sync(), per-block t_s/rmr, warp-per-(r, c-quad) finalize. Reassociated
+// vs the stock two-kernel path (fixed deterministic order, no atomics), so
+// results differ from stock within float tolerance but are run-to-run stable.
+//
+// Gated to R <= GR_FUSED_MAX_R: beyond that the stock pair wins because the
+// fused mapping re-reads the int8 tables per row through L2 (cold-cache
+// microbench on GB10, us/site -- stock: R1 39.9, R2 40.8, R3 43.9, R4 55.3,
+// R5 60.4, R6 65.4; fused: R1 34.0, R2 37.5, R3 43.1, R4 50.8, R5 59.1,
+// R6 77.1).
+// ---------------------------------------------------------------------------
+
+#define GR_FUSED_THREADS 256
+#define GR_FUSED_WARPS (GR_FUSED_THREADS / 32)
+#define GR_FUSED_MAX_R 4
+
+template <int H, bool HALF_OUT>
+__global__ __launch_bounds__(GR_FUSED_THREADS, 4)
+void gr_mix_fused_i8_kernel
+(
+    const float* __restrict__ streams,
+    const int8_t* __restrict__ fn_q,
+    const float* __restrict__ fn_s,
+    const int8_t* __restrict__ up_q,
+    const float* __restrict__ up_s,
+    const half* __restrict__ w,
+    float* __restrict__ dots,
+    float* __restrict__ post,
+    void* __restrict__ mixed,
+    const int R,
+    const int M,
+    const int D,
+    const int LR,
+    const float rms_eps
+)
+{
+    const int D4 = D / 4;
+    const int lane = threadIdx.x % 32;
+    const int gwarp = blockIdx.x * GR_FUSED_WARPS + threadIdx.x / 32;
+    const int nwarps = gridDim.x * GR_FUSED_WARPS;
+
+    extern __shared__ float fsmem[];
+    float* t_s = fsmem;              // R * LR
+    float* rmr_s = fsmem + R * LR;   // R * H
+
+    // Phase A: dots, item p = (r * (M + 1) + j) * H + h (flat dots index)
+    const int npairs1 = (M + 1) * H;
+    const int npairs = R * npairs1;
+    const int D8 = D / 8;
+    for (int p = gwarp; p < npairs; p += nwarps)
+    {
+        const int r = p / npairs1;
+        const int jl = p - r * npairs1;
+        const int j = jl / H;
+        const int h = jl % H;
+        const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
+        const float sj = (j < M) ? __ldg(fn_s + j) : 1.0f;
+        float a = 0.0f;
+        if (j < M)
+        {
+            const int2* f8 = (const int2*) (fn_q + ((size_t) j * H + h) * D);
+            const float4* sh = s4 + (size_t) h * D4;
+            for (int c = lane; c < D8; c += 32)
+            {
+                int2 pk = __ldcs(f8 + c);
+                float4 s0 = __ldg(sh + 2 * c);
+                float4 s1 = __ldg(sh + 2 * c + 1);
+                const int8_t* q = (const int8_t*) &pk;
+                a = fmaf(s0.x, (float) q[0], a);
+                a = fmaf(s0.y, (float) q[1], a);
+                a = fmaf(s0.z, (float) q[2], a);
+                a = fmaf(s0.w, (float) q[3], a);
+                a = fmaf(s1.x, (float) q[4], a);
+                a = fmaf(s1.y, (float) q[5], a);
+                a = fmaf(s1.z, (float) q[6], a);
+                a = fmaf(s1.w, (float) q[7], a);
+            }
+        }
+        else
+        {
+            for (int c = lane; c < D4; c += 32)
+            {
+                float4 s = __ldg(s4 + (size_t) h * D4 + c);
+                a = fmaf(s.x, s.x, fmaf(s.y, s.y, fmaf(s.z, s.z, fmaf(s.w, s.w, a))));
+            }
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            a += __shfl_down_sync(0xffffffffu, a, offset);
+        if (lane == 0) dots[p] = a * sj;
+    }
+
+    // L2 prefetch of this warp's phase-B up_q columns (shared across rows;
+    // 3.3 MB at the Qwen3.8 shape fits L2, so phase B reads hit L2)
+    for (int c = gwarp; c < D4; c += nwarps)
+    {
+        #pragma unroll
+        for (int hh = 0; hh < H; ++hh)
+        {
+            const char* base = (const char*) (up_q + (((size_t) hh * D4 + c) * LR) * 4);
+            for (int off = lane * 128; off < LR * 4; off += 32 * 128)
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(base + off));
+        }
+    }
+
+    cg::this_grid().sync();
+
+    // t_s / rmr / post, redundantly per block (dots reads are L2-hot)
+    const int nrows = M + 1;
+    if (threadIdx.x < (unsigned) (R * H))
+    {
+        const int r = threadIdx.x / H;
+        const int hh = threadIdx.x % H;
+        rmr_s[threadIdx.x] = rsqrtf(dots[((size_t) r * nrows + M) * H + hh] / (float) D + rms_eps);
+    }
+    __syncthreads();
+    const float inv_h = 1.0f / (float) H;
+    for (int idx = threadIdx.x; idx < R * LR; idx += GR_FUSED_THREADS)
+    {
+        const int r = idx / LR;
+        const int i = idx - r * LR;
+        const float* dr = dots + (size_t) r * nrows * H;
+        float v = 0.0f;
+        #pragma unroll
+        for (int hh = 0; hh < H; ++hh)
+            v = fmaf(rmr_s[r * H + hh], dr[(size_t) i * H + hh], v);
+        v *= inv_h;
+        t_s[idx] = v * sigmoidf_(v);
+    }
+    if (post && blockIdx.x == 0 && threadIdx.x < (unsigned) (R * H))
+    {
+        const int r = threadIdx.x / H;
+        const int hh = threadIdx.x % H;
+        const float* dr = dots + (size_t) r * nrows * H;
+        float v = 0.0f;
+        #pragma unroll
+        for (int hhh = 0; hhh < H; ++hhh)
+            v = fmaf(rmr_s[r * H + hhh], dr[(size_t) (LR + hh) * H + hhh], v);
+        post[threadIdx.x] = 2.0f * sigmoidf_(v * inv_h);
+    }
+    __syncthreads();
+
+    // Phase B: finalize, warp per (r, c-quad)
+    const int nq = R * D4;
+    for (int qq = gwarp; qq < nq; qq += nwarps)
+    {
+        const int r = qq / D4;
+        const int c = qq - r * D4;
+        const float* t_r = t_s + r * LR;
+        const float* rmr_r = rmr_s + r * H;
+        const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
+        float4 g[H];
+        #pragma unroll
+        for (int hh = 0; hh < H; ++hh) g[hh] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        int i = lane;
+        for (; i + 96 < LR; i += 128)
+        {
+            int u[4][H];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+                #pragma unroll
+                for (int hh = 0; hh < H; ++hh)
+                    u[k][hh] = __ldcs((const int*) (up_q + ((((size_t) hh * D4 + c) * LR + i + 32 * k) * 4)));
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                float ti = t_r[i + 32 * k];
+                #pragma unroll
+                for (int hh = 0; hh < H; ++hh)
+                {
+                    const int8_t* qb = (const int8_t*) &u[k][hh];
+                    g[hh].x = fmaf(ti, (float) qb[0], g[hh].x);
+                    g[hh].y = fmaf(ti, (float) qb[1], g[hh].y);
+                    g[hh].z = fmaf(ti, (float) qb[2], g[hh].z);
+                    g[hh].w = fmaf(ti, (float) qb[3], g[hh].w);
+                }
+            }
+        }
+        for (; i < LR; i += 32)
+        {
+            float ti = t_r[i];
+            #pragma unroll
+            for (int hh = 0; hh < H; ++hh)
+            {
+                int u = __ldcs((const int*) (up_q + ((((size_t) hh * D4 + c) * LR + i) * 4)));
+                const int8_t* qb = (const int8_t*) &u;
+                g[hh].x = fmaf(ti, (float) qb[0], g[hh].x);
+                g[hh].y = fmaf(ti, (float) qb[1], g[hh].y);
+                g[hh].z = fmaf(ti, (float) qb[2], g[hh].z);
+                g[hh].w = fmaf(ti, (float) qb[3], g[hh].w);
+            }
+        }
+        #pragma unroll
+        for (int hh = 0; hh < H; ++hh)
+            for (int offset = 16; offset > 0; offset >>= 1)
+            {
+                g[hh].x += __shfl_xor_sync(0xffffffffu, g[hh].x, offset);
+                g[hh].y += __shfl_xor_sync(0xffffffffu, g[hh].y, offset);
+                g[hh].z += __shfl_xor_sync(0xffffffffu, g[hh].z, offset);
+                g[hh].w += __shfl_xor_sync(0xffffffffu, g[hh].w, offset);
+            }
+        if (lane != 0) continue;
+        float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        #pragma unroll
+        for (int hh = 0; hh < H; ++hh)
+        {
+            float4 s = s4[(size_t) hh * D4 + c];
+            half4 wq = *(const half4*) (w + (size_t) hh * D + 4 * c);
+            float4 us = *(const float4*) (up_s + (size_t) hh * D + 4 * c);
+            float coef = rmr_r[hh] * inv_h;
+            o.x = fmaf(sigmoidf_(g[hh].x * us.x) * coef * LOW_TO_FLOAT(wq.x),  s.x, o.x);
+            o.y = fmaf(sigmoidf_(g[hh].y * us.y) * coef * HIGH_TO_FLOAT(wq.x), s.y, o.y);
+            o.z = fmaf(sigmoidf_(g[hh].z * us.z) * coef * LOW_TO_FLOAT(wq.y),  s.z, o.z);
+            o.w = fmaf(sigmoidf_(g[hh].w * us.w) * coef * HIGH_TO_FLOAT(wq.y), s.w, o.w);
+        }
+        if (HALF_OUT)
+        {
+            half2* out2 = (half2*) ((half*) mixed + (size_t) r * D);
+            out2[c * 2] = __floats2half2_rn(o.x, o.y);
+            out2[c * 2 + 1] = __floats2half2_rn(o.z, o.w);
+        }
+        else
+            ((float4*) ((float*) mixed + (size_t) r * D))[c] = o;
+    }
+}
+
+static bool gr_tuned_enabled()
+{
+    static const bool v = []()
+    {
+        const char* e = getenv("EXL3_GR_TUNED");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+// Resident-block count for the fused kernel, or 0 when cooperative launch is
+// unavailable (caller falls back to the stock two-kernel path). Queried with
+// the maximum smem footprint (GR_FUSED_MAX_R) so one count covers all R.
+static int gr_fused_blocks(int max_smem, bool half_out)
+{
+    static int cached[2] = { -1, -1 };
+    int slot = half_out ? 1 : 0;
+    if (cached[slot] >= 0) return cached[slot];
+    int dev, nsm, nb = 0, coop = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+    cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev);
+    if (coop)
+    {
+        if (half_out)
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &nb, gr_mix_fused_i8_kernel<4, true>, GR_FUSED_THREADS, max_smem);
+        else
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &nb, gr_mix_fused_i8_kernel<4, false>, GR_FUSED_THREADS, max_smem);
+    }
+    cached[slot] = nb * nsm;
+    return cached[slot];
+}
+
 void gr_mix_int8
 (
     const at::Tensor& streams,           // (R, H, D) float
@@ -1615,6 +1881,40 @@ void gr_mix_int8
     TORCH_CHECK(fn_q.size(1) == H * D && w.numel() == H * D, "gr_mix_int8: dims");
     TORCH_CHECK(fn_s.numel() == M && up_s.numel() == H * D, "gr_mix_int8: scale shapes");
     TORCH_CHECK(dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix_int8: dots shape");
+
+    if (gr_tuned_enabled() && R <= GR_FUSED_MAX_R && D % 16 == 0)
+    {
+        const bool hout = mixed.dtype() == at::kHalf;
+        int fused_smem = (R * LR + R * 4) * sizeof(float);
+        int nblocks = gr_fused_blocks((GR_FUSED_MAX_R * LR + GR_FUSED_MAX_R * 4) * sizeof(float), hout);
+        if (nblocks > 0)
+        {
+            const float* s_p = (const float*) streams.data_ptr();
+            const int8_t* fq_p = (const int8_t*) fn_q.data_ptr();
+            const float* fs_p = (const float*) fn_s.data_ptr();
+            const int8_t* uq_p = (const int8_t*) up_q.data_ptr();
+            const float* us_p = (const float*) up_s.data_ptr();
+            const half* w_p = (const half*) w.data_ptr();
+            float* d_p = (float*) dots.data_ptr();
+            float* post_p = post ? (float*) post.value().data_ptr() : nullptr;
+            void* mx_p = mixed.data_ptr();
+            float eps = (float) rms_eps;
+            void* args[] = { &s_p, &fq_p, &fs_p, &uq_p, &us_p, &w_p, &d_p, &post_p, &mx_p,
+                             (void*) &R, (void*) &M, (void*) &D, (void*) &LR, &eps };
+            cudaError_t err;
+            if (hout)
+                err = cudaLaunchCooperativeKernel(
+                    (void*) gr_mix_fused_i8_kernel<4, true>, dim3(nblocks),
+                    dim3(GR_FUSED_THREADS), args, fused_smem, stream);
+            else
+                err = cudaLaunchCooperativeKernel(
+                    (void*) gr_mix_fused_i8_kernel<4, false>, dim3(nblocks),
+                    dim3(GR_FUSED_THREADS), args, fused_smem, stream);
+            TORCH_CHECK(err == cudaSuccess, "gr_mix_int8 fused launch: ", cudaGetErrorString(err));
+            cuda_check(cudaPeekAtLastError());
+            return;
+        }
+    }
 
     dim3 grid_a(M + 1, R);
     gr_dots_i8_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>

@@ -78,6 +78,25 @@ class TestGrMixTiled(unittest.TestCase):
                 post2, mixed2 = m._mix(x, cached = False)
                 self.assertTrue(torch.equal(mixed, mixed2) and torch.equal(post, post2))
 
+    @unittest.skipUnless(os.environ.get("EXL3_GR_TUNED") == "1", "tuned kernel disabled")
+    def test_tuned_fused_decode(self):
+        # EXL3_GR_TUNED=1 routes R <= 4 gr_mix_int8 calls through the cooperative fused
+        # kernel (R > 4 stays on the stock pair); both must match the fp32 reference to
+        # tolerance and be bit-reproducible
+        m = make_site(2560, 320, True)
+        for R in (1, 2, 3, 4, 8):
+            torch.manual_seed(R + 100)
+            x = torch.randn(1, R, 4, 2560, device = DEVICE) * 3.0
+            ref_post, ref_mixed = m._mix_ref(x)
+            post, mixed = m._mix(x, cached = False)
+            self.assertLess(rel(mixed, ref_mixed.view(R, 2560)), 3e-3, R)
+            # post tolerance is looser than the stock-pair test's 1e-3: the stock
+            # kernel itself deviates up to ~2.5e-3 from the fp32 reference on these
+            # seeds, so the tuned kernel is only required to land in the same band
+            self.assertLess(rel(post, ref_post.view(R, 4)), 5e-3, R)
+            post2, mixed2 = m._mix(x, cached = False)
+            self.assertTrue(torch.equal(mixed, mixed2) and torch.equal(post, post2))
+
     def test_tiled_is_deterministic(self):
         m = make_site(1024, 320, True)
         for R in (100, 2048):
