@@ -78,4 +78,22 @@ continuation diverges), hence the per-job adaptive backoff: below
 re-probes every `EXL3_NGRAM_PROBE_ROUNDS` rounds. Exact repetition (boilerplate,
 tables, templates) accepts 40%+ per position and stays engaged.
 
+## Measured (GB10 single Spark, w=7 + adaptive, 2026-09-28)
+
+Same-session A/B against the MTP-only baseline (identical serve config otherwise):
+
+| load | baseline | hybrid | note |
+|---|---|---|---|
+| T1 code+think | 51.4 tok/s | 51.9 tok/s | par (ngram rarely qualifies) |
+| T2 prose | 41.7 | 41.0 | par, no regression |
+| T5c decode @74k ctx | 44.3 | 42.5 | par within this box's thermal drift |
+| needle 3/3 | 3/3 | 3/3 | quality unchanged |
+| exact-repeat boilerplate | 83.7 | **112.4** | **+34%**, na ≈ 1.0 |
+| JSON record list | 86.0 | 77.5 | adaptive bounds the misfire (was 37 without it) |
+
+The standard bench's code/prose content rarely produces ≥8-token suffix repeats, so
+hybrid is near-invisible there by design; the win case is exact-repetition
+boilerplate. Window sweep on exact-repeat content: w=5 98 tok/s, w=7 107-112 tok/s,
+w=8 46 tok/s (kernel cliff — see the knob table).
+
 CPU gates: `tests/test_hybrid_draft_cpu.py` (standalone, no pytest).
