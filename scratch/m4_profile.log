@@ -1,0 +1,10 @@
+exllamav3 at /home/xujie/qwen38-exl3/exllamav3-spec/exllamav3/__init__.py
+MemAvailable before load: 117.5 GiB
+model loaded in 26s, MemAvailable 63.7 GiB
+USDT:2026-09-28 11:56:20 3100752:3100752 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-28 11:56:22 3100752:3100752 SyncActivityProfilerHandler.cpp:59] profiler_stop
+Traceback (most recent call last):
+  File "/home/xujie/qwen38-exl3/exllamav3-spec/scratch/profile_decode_floor.py", line 128, in <module>
+    f"wall mean={meta['wall_mean_ms']}ms p50={meta['wall_p50']}ms "
+                                              ~~~~^^^^^^^^^^^^
+KeyError: 'wall_p50'

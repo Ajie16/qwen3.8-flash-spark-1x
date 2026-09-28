@@ -1,0 +1,46 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+void exl3_moe_coop_ns::exl3_moe_coop_a_kernel<3, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us     222.583ms        17.71%     222.583ms      94.716us          2350  
+void exl3_mgemm_kernel<4, false, true, 2, 16, 16, 51...         0.00%       0.000us         0.00%       0.000us       0.000us     178.252ms        14.19%     178.252ms     104.854us          1700  
+void exl3_moe_coop_ns::exl3_moe_coop_b_kernel<3, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us     105.665ms         8.41%     105.665ms      44.964us          2350  
+void gr_finalize_i8_kernel<4, true>(float const*, fl...         0.00%       0.000us         0.00%       0.000us       0.000us      98.347ms         7.83%      98.347ms      20.278us          4850  
+void gr_dots_i8_kernel<4>(float const*, signed char ...         0.00%       0.000us         0.00%       0.000us       0.000us      87.143ms         6.93%      87.143ms      17.968us          4850  
+void exl3_gemm_kernel<5, false, false, 2, 16, 32, 25...         0.00%       0.000us         0.00%       0.000us       0.000us      86.563ms         6.89%      86.563ms       1.731ms            50  
+void exl3_moe_coop_ns::exl3_moe_coop_a_kernel<4, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us      85.047ms         6.77%      85.047ms      35.436us          2400  
+void exl3_gemm_kernel<4, false, true, 2, 16, 32, 256...         0.00%       0.000us         0.00%       0.000us       0.000us      76.832ms         6.11%      76.832ms      45.195us          1700  
+void exl3_mgemm_kernel<5, false, false, 2, 16, 16, 5...         0.00%       0.000us         0.00%       0.000us       0.000us      71.144ms         5.66%      71.144ms     118.573us           600  
+void exl3_gemm_kernel<5, false, true, 2, 16, 32, 128...         0.00%       0.000us         0.00%       0.000us       0.000us      36.575ms         2.91%      36.575ms      52.250us           700  
+routing_gemv_kernel(__half const*, __half const*, __...         0.00%       0.000us         0.00%       0.000us       0.000us      35.178ms         2.80%      35.178ms      14.657us          2400  
+void cuda_recurrent_gated_delta_rule_kernel_128<fals...         0.00%       0.000us         0.00%       0.000us       0.000us      34.582ms         2.75%      34.582ms      19.212us          1800  
+void exl3_moe_coop_ns::exl3_moe_coop_b_kernel<4, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us      31.534ms         2.51%      31.534ms      13.419us          2350  
+                                               aten::mm         0.14%       1.661ms         0.31%       3.535ms      35.352us      16.063ms         1.28%      16.129ms     161.287us           100  
+std::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us      12.907ms         1.03%      12.907ms     258.138us            50  
+void exl3_mgemm_kernel<5, false, true, 2, 16, 16, 51...         0.00%       0.000us         0.00%       0.000us       0.000us      12.881ms         1.03%      12.881ms     128.809us           100  
+gdn_ba_gemv_kernel(__half const*, __half const*, __h...         0.00%       0.000us         0.00%       0.000us       0.000us       9.962ms         0.79%       9.962ms       5.534us          1800  
+void exl3_gemm_kernel<5, false, false, 2, 16, 32, 12...         0.00%       0.000us         0.00%       0.000us       0.000us       9.491ms         0.76%       9.491ms      15.819us           600  
+void conv1d_update_kernel<true, false>(__nv_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us       9.484ms         0.75%       9.484ms       5.269us          1800  
+                        _paged_attn_decode_split_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       9.448ms         0.75%       9.448ms      15.747us           600  
+routing_std_topk_kernel(__half const*, long*, __half...         0.00%       0.000us         0.00%       0.000us       0.000us       9.357ms         0.74%       9.357ms       3.899us          2400  
+void hc_apply_kernel<4, float, false>(float*, float ...         0.00%       0.000us         0.00%       0.000us       0.000us       7.507ms         0.60%       7.507ms       1.564us          4800  
+void gated_delta_net_fused_op_3_kernel<__nv_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us       3.876ms         0.31%       3.876ms       2.153us          1800  
+std::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us       3.156ms         0.25%       3.156ms      63.120us            50  
+void gated_rms_norm_kernel<32, __half, __nv_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us       2.933ms         0.23%       2.933ms       1.629us          1800  
+                      _paged_attn_decode_combine_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       2.417ms         0.19%       2.417ms       4.028us           600  
+void rope_kernel<2, true>(__half const*, __half*, __...         0.00%       0.000us         0.00%       0.000us       0.000us       2.304ms         0.18%       2.304ms       3.840us           600  
+                                    cudaPeekAtLastError         0.07%     764.872us         0.07%     764.872us       0.035us       1.992ms         0.16%       1.992ms       0.090us         22050  
+                                _qsa_pool_update_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       1.879ms         0.15%       1.879ms       3.131us           600  
+                                       cudaLaunchKernel         8.41%      97.221ms         8.57%      99.028ms       3.312us       1.757ms         0.14%       1.757ms       0.059us         29900  
+void exl3_moe_coop_ns::exl3_moe_coop_a_kernel<5, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us       1.716ms         0.14%       1.716ms      34.325us            50  
+void exl3_moe_coop_ns::exl3_moe_coop_b_kernel<5, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us       1.430ms         0.11%       1.430ms      14.296us           100  
+                                _paged_kv_update_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       1.006ms         0.08%       1.006ms       1.677us           600  
+                               _mla_plane_update_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     974.786us         0.08%     974.786us       1.625us           600  
+                                      _qsa_stage_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     778.193us         0.06%     778.193us       1.297us           600  
+deinterleave_qg_kernel(uint4 const*, uint4*, uint4*,...         0.00%       0.000us         0.00%       0.000us       0.000us     697.778us         0.06%     697.778us       1.163us           600  
+                                            aten::copy_         0.21%       2.436ms         0.56%       6.464ms       6.464us     608.202us         0.05%     608.202us       0.608us          1000  
+mul_sigmoid_kernel_h(__half*, __half const*, unsigne...         0.00%       0.000us         0.00%       0.000us       0.000us     523.410us         0.04%     523.410us       0.872us           600  
+                                     aten::index_select         0.10%       1.140ms         0.15%       1.692ms      16.915us     332.403us         0.03%     332.403us       3.324us           100  
+void at::native::(anonymous namespace)::indexSelectS...         0.00%       0.000us         0.00%       0.000us       0.000us     332.403us         0.03%     332.403us       6.648us            50  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.156s
+Self CUDA time total: 1.257s

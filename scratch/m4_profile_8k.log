@@ -1,0 +1,7 @@
+exllamav3 at /home/xujie/qwen38-exl3/exllamav3-spec/exllamav3/__init__.py
+MemAvailable before load: 117.5 GiB
+model loaded in 12s, MemAvailable 63.7 GiB
+USDT:2026-09-28 12:00:26 3106406:3106406 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-28 12:00:27 3106406:3106406 SyncActivityProfilerHandler.cpp:59] profiler_stop
+CTX 8000: ptok=5943 prefill=10.03s wall mean=27.745ms p50=27.071ms min=26.941 max=37.637
+DONE
