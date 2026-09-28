@@ -234,7 +234,7 @@ def test_verify_walk_with_pads():
 
 def test_hybrid_account():
     g = _gen_stub()
-    j1, j2, j3 = object(), object(), object()
+    j1, j2, j3 = (SimpleNamespace(serial_number = i) for i in range(3))
     g.active_jobs = [j1, j2, j3]
     g._hybrid_round_src = {
         id(j1): ("ngram", 5),
@@ -253,6 +253,40 @@ def test_hybrid_account():
     print("hybrid account ok")
 
 
+def test_ng_adaptive():
+    import exllamav3.generator.generator as G
+    old = (G._HYBRID_ADAPT_ROUNDS, G._HYBRID_PROBE_ROUNDS, G._HYBRID_MIN_ACC)
+    G._HYBRID_ADAPT_ROUNDS, G._HYBRID_PROBE_ROUNDS, G._HYBRID_MIN_ACC = 4, 3, 0.25
+    try:
+        g = _gen_stub()
+        j = SimpleNamespace(serial_number = 7)
+        assert Generator._hybrid_ng_engaged(g, j)  # default on
+
+        # Four ngram rounds accepting 1/16 each (0.0625 < 0.25) -> disengage
+        for _ in range(4):
+            g.active_jobs = [j]
+            g._hybrid_round_src = {id(j): ("ngram", 16)}
+            Generator._hybrid_account(g, [0, 9], [2], set())
+        assert j._ng_on is False
+        assert not Generator._hybrid_ng_engaged(g, j)
+
+        # Re-probe after PROBE_ROUNDS off-rounds
+        assert not Generator._hybrid_ng_engaged(g, j)
+        assert Generator._hybrid_ng_engaged(g, j)  # 3rd call re-engages
+        assert j._ng_on is True
+
+        # Good acceptance keeps it engaged
+        j2 = SimpleNamespace(serial_number = 8)
+        for _ in range(8):
+            g.active_jobs = [j2]
+            g._hybrid_round_src = {id(j2): ("ngram", 16)}
+            Generator._hybrid_account(g, [0, 9], [14], set())
+        assert getattr(j2, "_ng_on", True) is True
+    finally:
+        G._HYBRID_ADAPT_ROUNDS, G._HYBRID_PROBE_ROUNDS, G._HYBRID_MIN_ACC = old
+    print("ng adaptive ok")
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     test_pad_rows()
@@ -262,4 +296,5 @@ if __name__ == "__main__":
     test_hybrid_selection()
     test_verify_walk_with_pads()
     test_hybrid_account()
+    test_ng_adaptive()
     print("all hybrid-draft CPU gates passed")

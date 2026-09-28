@@ -67,6 +67,16 @@ _HYBRID_NGRAM = _os.environ.get("EXL3_HYBRID_NGRAM", "0") != "0"
 _HYBRID_MIN_MATCH = max(1, int(_os.environ.get("EXL3_NGRAM_MIN_MATCH", "8")))
 _HYBRID_MAX_DRAFT = max(1, int(_os.environ.get("EXL3_NGRAM_MAX_DRAFT", "16")))
 _HYBRID_STATS = _os.environ.get("EXL3_HYBRID_STATS", "0") != "0"
+# Per-job adaptive ngram backoff: a long suffix repeat whose continuation diverges
+# (structural repeats with varying content, e.g. JSON records) wastes the wide window.
+# Evaluate each job's per-position ngram acceptance every EXL3_NGRAM_ADAPT_ROUNDS ngram
+# rounds; below EXL3_NGRAM_MIN_ACC the job falls back to MTP and re-probes after
+# EXL3_NGRAM_PROBE_ROUNDS rounds. 0.25 of a 16-wide window ≈ 4 tokens/round, roughly
+# the MTP round's expected yield here
+_HYBRID_ADAPTIVE = _os.environ.get("EXL3_NGRAM_ADAPTIVE", "1") != "0"
+_HYBRID_MIN_ACC = float(_os.environ.get("EXL3_NGRAM_MIN_ACC", "0.25"))
+_HYBRID_ADAPT_ROUNDS = max(1, int(_os.environ.get("EXL3_NGRAM_ADAPT_ROUNDS", "16")))
+_HYBRID_PROBE_ROUNDS = max(1, int(_os.environ.get("EXL3_NGRAM_PROBE_ROUNDS", "64")))
 # Padding token for rows drafted shorter than the round's combined window. A pad
 # position verifies like any draft position under match-verify: it accepts iff the
 # target happens to sample the pad token there (exact, just unlikely) and rejects the
@@ -1212,7 +1222,7 @@ class Generator:
             draft, _match_len = job.probe_ngram_draft(
                 self.hybrid_ngram_max, self.hybrid_ngram_min_match
             )
-            if draft.shape[-1] >= 1:
+            if draft.shape[-1] >= 1 and self._hybrid_ng_engaged(job):
                 candidates[id(job)] = draft
 
         st = self._hybrid_stats
@@ -1277,6 +1287,28 @@ class Generator:
         return _hybrid_pad_rows(drafts)
 
 
+    def _hybrid_ng_engaged(self, job):
+        """
+        Per-job adaptive ngram engagement (EXL3_NGRAM_ADAPTIVE). True while the job's
+        ngram drafts pay; False after its measured per-position acceptance fell below
+        EXL3_NGRAM_MIN_ACC, in which case it drafts MTP and re-probes after
+        EXL3_NGRAM_PROBE_ROUNDS rounds. State lives on the job and dies with it.
+        """
+        if not _HYBRID_ADAPTIVE:
+            return True
+        if getattr(job, "_ng_on", True):
+            return True
+        n = getattr(job, "_ng_off_rounds", 0) + 1
+        if n >= _HYBRID_PROBE_ROUNDS:
+            job._ng_on = True
+            job._ng_eval_n = 0
+            job._ng_eval_k = 0
+            n = 0
+            logger.info("hybrid: job %s ngram re-engaged (probe)", job.serial_number)
+        job._ng_off_rounds = n
+        return job._ng_on
+
+
     def _hybrid_account(self, logit_mapping, accepted_lengths, rewound_jobs):
         """
         Per-source drafted/accepted accounting for EXL3_HYBRID_STATS, hooked after the
@@ -1304,6 +1336,24 @@ class Generator:
             if kind == "ngram":
                 st["ng_drafted"] += width
                 st["ng_accepted"] += acc
+                # Adaptive engagement input (EXL3_NGRAM_ADAPTIVE): rolling per-position
+                # acceptance, evaluated every EXL3_NGRAM_ADAPT_ROUNDS ngram rounds
+                if _HYBRID_ADAPTIVE:
+                    r = getattr(job, "_ng_eval_rounds", 0) + 1
+                    n = getattr(job, "_ng_eval_n", 0) + width
+                    k = getattr(job, "_ng_eval_k", 0) + acc
+                    if r >= _HYBRID_ADAPT_ROUNDS:
+                        if n and k / n < _HYBRID_MIN_ACC:
+                            job._ng_on = False
+                            job._ng_off_rounds = 0
+                            logger.info(
+                                "hybrid: job %s ngram disengaged (acc %.3f < %.3f)",
+                                job.serial_number, k / n, _HYBRID_MIN_ACC,
+                            )
+                        r = n = k = 0
+                    job._ng_eval_rounds = r
+                    job._ng_eval_n = n
+                    job._ng_eval_k = k
             else:
                 st["mtp_drafted"] += width
                 st["mtp_accepted"] += acc

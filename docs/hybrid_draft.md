@@ -18,6 +18,10 @@ model) is untouched.
 | `EXL3_NGRAM_MIN_MATCH` | 8 | minimum suffix-repeat length to engage ngram |
 | `EXL3_NGRAM_MAX_DRAFT` | 16 | max continuation tokens drafted per ngram round |
 | `EXL3_HYBRID_STATS` | 0 | `hybrid-stats r=.. ng=.. na=.. ma=..` every 50 rounds: ngram round share, per-position ngram acceptance, per-position MTP acceptance |
+| `EXL3_NGRAM_ADAPTIVE` | 1 | per-job backoff: disengage ngram below `EXL3_NGRAM_MIN_ACC` acceptance, re-probe later |
+| `EXL3_NGRAM_MIN_ACC` | 0.25 | per-position ngram acceptance floor (0.25 × 16-wide window ≈ the MTP round's yield) |
+| `EXL3_NGRAM_ADAPT_ROUNDS` | 16 | ngram rounds between engagement evaluations |
+| `EXL3_NGRAM_PROBE_ROUNDS` | 64 | rounds a disengaged job waits before re-probing |
 
 ## Round structure (`Generator.iterate_hybrid_gen`)
 
@@ -58,5 +62,20 @@ skipped draft forward leaves nothing stale.
   clamp acceptance to the real draft width (pad accepts have no conf entry).
 - **Page budget**: `draft_reserve_tokens` is bumped to `EXL3_NGRAM_MAX_DRAFT` so a wide
   ngram window never outruns the job's allocated pages.
+- **Recurrent state history**: GDN conv/state buffers are sized by the frontend from
+  the draft window (tabbyAPI: `max_history = draft_num_tokens`). A wider ngram window
+  overflows them — the generator clamps `EXL3_NGRAM_MAX_DRAFT` to `cache.max_history`
+  as a safety net, and the frontend should size `max_history` for the wider window
+  (the local tabbyAPI patch does, env-gated on `EXL3_HYBRID_NGRAM`).
+
+## Failure mode: structural repeats with varying content
+
+A long suffix repeat does not imply a repeating continuation — JSON record lists share
+long key prefixes but diverge at the values. The first live run accepted only ~8% per
+position on such content (and a wide window costs more than an MTP window once the
+continuation diverges), hence the per-job adaptive backoff: below
+`EXL3_NGRAM_MIN_ACC` per-position acceptance the job returns to MTP drafting and
+re-probes every `EXL3_NGRAM_PROBE_ROUNDS` rounds. Exact repetition (boilerplate,
+tables, templates) accepts 40%+ per position and stays engaged.
 
 CPU gates: `tests/test_hybrid_draft_cpu.py` (standalone, no pytest).
