@@ -282,3 +282,63 @@ diff -rq /tmp/tf-pristine/src/tensorfold ~/tensorfold-venv/lib/python3.12/site-p
 - **生产 EXL3 实际吃到的内核优化**：P1（省草稿投影）+ P2（TTFT 重排）+ P3（n-gram 预读）+ P4（视觉 scratch 回收）。P5/P6/P7 是"留了口子但 EXL3 生产不触发"的档位。
 - **没有 patch 脚本的直接改动**（P1–P4、V1–V6）都是就地编辑 venv 完成的，**上游升级 0.6.2+ 时会全部丢失且无脚本可重放**——升级前必须先重新 diff 本文件清单，逐项移植。这是本文件存在的主要原因。
 - 未知项：P2 的首 token 重排与 P1 的 logits=False 是否进入上游后续版本，未核对（diff 对象是 v0.6.1 tag）。
+
+---
+
+## 9. 原生引擎（路线 A · exllamav3）补丁
+
+TensorFold（本文件 §1–§8）是路线 B。**路线 A = exllamav3 1.5.1 fork + TabbyAPI，是"原生 EXL3 引擎"**，它自己的优化体系在这里。
+
+### 9.1 补丁清单（仓库 `exllamav3-patches/`，基线已钉死）
+
+| 补丁 | 提交数 | 基线 | 内容 |
+|---|---|---|---|
+| `feat-hybrid-draft.patch`（189 KB） | 23 | `vcruz305/exllamav3 @ 74b6f5a` | 见 9.2 的 M1→M3 全链 + 融合 GR kernel |
+| `feat-spec-sampling.patch`（90 KB） | 14 | 同上，链起点 `5e52ac9` | 精确推测采样验证路径（与 hybrid-draft **互相独立，不要同时应用**） |
+| `tabbyapi-local.patch` | 1 | `theroyallab/tabbyAPI @ f07131c` | `local: allow max_history bump under EXL3_HYBRID_NGRAM` |
+
+提交历史在 `*.commits.txt`（作者/日期/信息全保留）。**为什么是补丁不是分支**：Ajie16/exllamav3 fork 的历史里有 5 个上游继承的旧提交含 Mistral key（README.md，当前已删除），GitHub Push Protection 扫全历史拒绝推送。解封 URL 在 `exllamav3-patches/README.md`，授权后可推完整 1800+ 提交历史。
+
+### 9.2 feat-hybrid-draft 的优化内容（M1→M3，2026-09-27/28）
+
+| 阶段 | 内容 | 关键提交 |
+|---|---|---|
+| **M1 观测** | `spec_transform`/`extract_spec` 原语 + **spec-shadow 只观测模式**（EXL3_SPEC_SHADOW，不改采样，先量出投机接受率的真实分布） | `19de191` `fe20eac` `4b8ab82` |
+| **M2 精确验证** | **EXL3_SPEC_SAMPLING 精确推测采样验证路径**：批量乐观验证、window cap、tested-basis shadow、adaptive engagement；含 `docs/spec_sampling.md` 与 CPU 门禁 | `8fd59de` `4807547` `35d04a2` |
+| **M3 混合草稿** | **EXL3_HYBRID_NGRAM：n-gram 草稿 + MTP 草稿混合**——hybrid 宽度钳制到 cache max_history、per-job 自适应退避（EXL3_NGRAM_ADAPTIVE）、默认 EXL3_NGRAM_MAX_DRAFT=7（**前向 kernel 在 q_len>8 有悬崖**，ab5671a 修的默认值坑） | `54b0072` `c902ead` `d11d060` `ab5671a` |
+| **kernel** | **EXL3_GR_TUNED 协作式融合 GR mix kernel（R ≤ 4）** | `c5de62d` |
+| 剖析 | M3 实测文档（w=7 + adaptive vs MTP-only 基线）、M4 decode 下限 profiling | `6d3a91a` `deab4d3` |
+
+配套：Mia 风格的 `exllamav3-patches/` 之外还有 `~/qwen38-exl3/` 运行布局（见 9.3）。
+
+### 9.3 本机布局与易错点（★实际跑的是 worktree）
+
+```
+~/qwen38-exl3/
+├── exllamav3/          # 主检出 master @ 74b6f5a（venv .pth 指向这里——但不是服务用的！）
+├── exllamav3-spec/     # ★ 同仓库 git worktree，检出 feat/hybrid-draft ← serve.sh 实际加载的引擎
+├── tabbyAPI/           # detached @ b8c0497（本地提交在 f07131c 之上）
+├── state/config.yml    # serve.sh 渲染产物
+└── venv/               # exllamav3 可编辑安装
+```
+
+**易错点**：`serve.sh` 运行的引擎是 `exllamav3-spec/`（worktree），不是 `.pth` 指向的 `exllamav3/`。判断服务加载了哪个，看日志开头的：
+`exllamav3 1.5.1.post1 (fork) at /home/xujie/qwen38-exl3/exllamav3-spec/exllamav3`
+
+### 9.4 应用与回滚
+
+```bash
+# exllamav3（在 spark-2）
+cd ~/qwen38-exl3/exllamav3
+git stash && git checkout 74b6f5a && git checkout -b feat/hybrid-draft-v2
+git apply ~/workspace/qwen3.8-flash-spark-1x/exllamav3-patches/feat-hybrid-draft.patch
+# tabbyAPI 同理（f07131c + tabbyapi-local.patch），两个 exllamav3 补丁互斥
+```
+
+路线 A/B 互斥（EXL3 单机独占 ~88+ GiB vs TensorFold 互斥，切之前先停另一个）。当前生产是路线 B（TensorFold）。
+
+### 9.5 路线 A 实测基线（本机数字）
+
+prefill @32k **~1,130 T/s**（@75k 未测）；decode 中文 42–49 tok/s；KV 池 1,572,864 token（共享池，`cache_size`）；n-gram 表 `ngram_ram: true` 全放内存；视觉 TabbyAPI `vision: true`。
+对比路线 B（TensorFold+MLX）：prefill 2,425 T/s 但只能配审查权重要么自己转（g32 约束）。
+**选 A 的理由是抗审查权重生态 + exllamav3 原生实现，不是速度。**
