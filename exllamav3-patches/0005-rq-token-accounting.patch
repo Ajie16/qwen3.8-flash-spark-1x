@@ -1,0 +1,17 @@
+diff --git a/exllamav3/generator/job.py b/exllamav3/generator/job.py
+index afc9329..08767c9 100644
+--- a/exllamav3/generator/job.py
++++ b/exllamav3/generator/job.py
+@@ -1047,7 +1047,11 @@ class Job:
+             "time_enqueued": self.time_enqueued,
+             "time_prefill": self.time_prefill,
+             "time_generate": self.time_generate,
+-            "rq_new_tokens": self.new_tokens,   # every token accepted so far counts; the requeued segment starts after them
++            # `self.rq_new_tokens` already holds every earlier segment; `self.new_tokens` is only
++            # this one. Adding them here is what keeps the reported total correct across the 2nd and
++            # later requeues - assigning self.new_tokens alone silently drops the earlier segments, and
++            # since accepted_draft_tokens is carried whole, the two counters then disagree.
++            "rq_new_tokens": self.rq_new_tokens + self.new_tokens,
+             "accepted_draft_tokens": self.accepted_draft_tokens,
+             "rejected_draft_tokens": self.rejected_draft_tokens,
+             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
