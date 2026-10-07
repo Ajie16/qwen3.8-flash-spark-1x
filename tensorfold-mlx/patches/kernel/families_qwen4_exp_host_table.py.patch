@@ -1,0 +1,11 @@
+--- a/tensorfold/families/qwen4_exp/host_table.py	2026-10-07 17:41:02.601942179 +0800
++++ b/tensorfold/families/qwen4_exp/host_table.py	2026-10-04 01:46:30.758282539 +0800
+@@ -326,7 +326,7 @@
+         return NVFP4Table(files, scale("weight_scale_2"))
+     if used[0] == "fp8":
+         return FP8Table(files, scale("weight_scale"))
+-    table = BF16Table(files) if used[0] == "bf16" else SSDTable(files) if ssd else HostTable(files)
++    table = BF16Table(files) if used[0] == "bf16" else ReadAhead(SSDTable(files)) if ssd else HostTable(files)
+     table.weight_scale = float(scale("weight_scale"))
+     return table
+ 

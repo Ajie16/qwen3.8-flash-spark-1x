@@ -1,0 +1,14 @@
+--- a/tensorfold/engine/call_gate.py	2026-10-07 17:41:02.595631981 +0800
++++ b/tensorfold/engine/call_gate.py	2026-10-03 10:22:07.061169590 +0800
+@@ -158,7 +158,10 @@
+         hits = [(hit, getattr(gate, "replay", False)) for gate in gates if (hit := gate.cut(new)) is not None]
+         if hits:
+             (at, fix), replay = min(hits, key=lambda h: (h[0][0], h[1]))   # the earliest; a fix before a replay
+-            new, state["cut"], state["replay"] = [*new[:at], *fix][:max_tokens - len(reply)], True, replay
++            # A fix landing half is worse than no fix: half a think-block close leaves the block
++            # open. Skip the cut unless the whole of it fits, and let max_tokens stop the run.
++            if max_tokens - len(reply) - at >= len(fix):
++                new, state["cut"], state["replay"] = [*new[:at], *fix], True, replay
+         for token in new:
+             for gate in gates:
+                 gate.observe(token)

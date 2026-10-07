@@ -1,0 +1,87 @@
+--- a/tensorfold/cuda/http.py	2026-10-07 17:41:02.592942148 +0800
++++ b/tensorfold/cuda/http.py	2026-10-04 01:46:30.757324607 +0800
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import json
++import threading
+ import time
+ import traceback
+ import uuid
+@@ -108,9 +109,9 @@
+                 return self._json(404, {"error": "not found"})
+             try:
+                 length = int(self.headers.get("Content-Length", 0))
+-                if not 0 <= length <= 32 * 1024**2:
++                if not 0 <= length <= 96 * 1024**2:
+                     self.close_connection = True             # the unread body must not reach the next request
+-                    return self._json(400, {"error": {"message": "request body exceeds the 32 MiB limit",
++                    return self._json(400, {"error": {"message": "request body exceeds the 96 MiB limit",
+                                                       "type": "invalid_request_error"}})
+                 body = json.loads(self.rfile.read(length) or b"{}")
+             except (json.JSONDecodeError, UnicodeDecodeError):
+@@ -145,16 +146,37 @@
+                 self.send_header("Connection", "close")
+                 self.end_headers()
+ 
+-                def emit(delta: dict[str, Any]) -> bool:
++                write_lock = threading.Lock()         # the ping thread shares this socket with the reply
++                wrote = [time.monotonic()]
++
++                def _write(text: str) -> bool:
+                     try:
+-                        self.wfile.write(f"data: {json.dumps(chunk(delta))}\n\n".encode())
+-                        self.wfile.flush()
+-                        return True
+-                    except OSError:             # reset, broken pipe, timed out, host unreachable: the client has gone
++                        with write_lock:
++                            self.wfile.write(text.encode())
++                            self.wfile.flush()
++                    except OSError:     # reset, broken pipe, timed out, host unreachable: the client has gone
+                         return False
++                    wrote[0] = time.monotonic()
++                    return True
++
++                def emit(delta: dict[str, Any]) -> bool:
++                    return _write(f"data: {json.dumps(chunk(delta))}\n\n")
+ 
+                 if chat:
+                     emit({"role": "assistant"})
++
++                # Queueing, prefilling and thinking all pass without a byte, which is minutes at
++                # this context length: an idle-read timeout in the client, a proxy or a load
++                # balancer severs the stream and the caller sees no answer at all. An SSE comment
++                # is ignored by every client and costs one line every 10 seconds of silence.
++                ping_stop = threading.Event()
++
++                def keepalive() -> None:
++                    while not ping_stop.wait(2.0):
++                        if time.monotonic() - wrote[0] >= 10.0:
++                            _write(": ping\n\n")
++
++                threading.Thread(target=keepalive, daemon=True).start()
+                 try:
+                     result = app.run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+                 except RequestCancelled:
+@@ -165,6 +187,8 @@
+                 except Exception as exc:
+                     _log_error(exc)
+                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
++                finally:
++                    ping_stop.set()
+                 if result["final"]:
+                     emit(result["final"])
+                 if result["calls"]:
+@@ -177,11 +201,7 @@
+                 end = chunk({}, result["finish"])
+                 end["tensorfold"] = result["stats"]
+                 end["usage"] = usage_of(result)          # every stream, as the Mac server's: clients count from it
+-                try:
+-                    self.wfile.write(f"data: {json.dumps(end)}\n\ndata: [DONE]\n\n".encode())
+-                    self.wfile.flush()
+-                except (BrokenPipeError, ConnectionResetError):
+-                    pass
++                _write(f"data: {json.dumps(end)}\n\ndata: [DONE]\n\n")
+                 self.close_connection = True
+                 return
+             try:

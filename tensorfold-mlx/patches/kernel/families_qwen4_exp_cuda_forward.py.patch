@@ -1,0 +1,22 @@
+--- a/tensorfold/families/qwen4_exp/cuda/forward.py	2026-10-07 17:41:02.601054384 +0800
++++ b/tensorfold/families/qwen4_exp/cuda/forward.py	2026-10-04 01:46:30.757844861 +0800
+@@ -471,6 +471,19 @@
+     return segs
+ 
+ 
++def read_ahead(w: Weights, history: np.ndarray, tokens: Sequence[int]) -> None:
++    """Start reading n-gram rows a later stage of ``tokens`` after ``history`` will look up."""
++
++    if not len(tokens):
++        return
++    toks = np.asarray(tokens, dtype=np.int64)
++    for layer in w.layers:
++        ple = layer.ple
++        start = getattr(getattr(ple, "table", None), "read_ahead", None) if ple is not None and getattr(w, "x3", None) is None else None
++        if start is not None:
++            start(ple.ngram.ids(history, toks))
++
++
+ def compute(w: Weights, segs: Sequence[Seg], b: Buffers, *, logits: bool = True, context: int | None = None,
+             ends: Sequence[int] = (), cuts: Sequence[Cut] = (), features=None):
+     """The forward's GPU work on staged rows (capturable); ``context`` bounds attention, ``ends`` get the head, ``cuts`` keep states."""

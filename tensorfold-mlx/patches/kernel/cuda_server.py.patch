@@ -1,0 +1,30 @@
+--- a/tensorfold/cuda/server.py	2026-10-07 17:41:02.594413817 +0800
++++ b/tensorfold/cuda/server.py	2026-10-03 10:32:15.221112292 +0800
+@@ -1,6 +1,8 @@
+ """OpenAI server for the CUDA engines: a family's ``cuda_engine`` gives ``eos``, ``generate`` and ``follow``."""
+ from __future__ import annotations
+ 
++_MIN_ANSWER = 256          # reply tokens a thinking budget never takes
++
+ import hashlib
+ import inspect
+ import json
+@@ -515,7 +517,17 @@
+         close = [*self.tok.encode("\n", add_special_tokens=False).ids, think_end]
+         if prepared.grammar is None:
+             close += self.tok.encode("\n\n", add_special_tokens=False).ids
+-        return ThinkBudget(prepared.think_budget, close, think_end)
++        # The cut replaces a reply token with ``close``, so the whole close has to fit under
++        # max_tokens. A budget that reaches the cap first would be cut to nothing: </think> never
++        # lands, split_thinking keeps the entire reply as reasoning, and the client is handed
++        # content: null with finish_reason "length" - a silent, empty answer. Clamp instead.
++        # Reserve a quarter of the ceiling for the answer, not merely the length of the close:
++        # a clamp that only fits the close hands the client two newlines and nothing else.
++        answer = max(_MIN_ANSWER, prepared.max_tokens // 4)
++        budget = min(prepared.think_budget, max(0, prepared.max_tokens - answer))
++        if budget < len(close):
++            return None                            # too little to think and still answer: do not cut
++        return ThinkBudget(budget, close, think_end)
+ 
+     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
+         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""

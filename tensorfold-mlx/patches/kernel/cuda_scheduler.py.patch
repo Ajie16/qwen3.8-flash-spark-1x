@@ -1,0 +1,50 @@
+--- a/tensorfold/cuda/scheduler.py	2026-10-07 17:41:02.594413817 +0800
++++ b/tensorfold/cuda/scheduler.py	2026-10-03 10:23:39.322176840 +0800
+@@ -6,6 +6,8 @@
+ import itertools
+ import queue
+ import threading
++import time
++import traceback
+ from typing import Any, Callable
+ 
+ from .memory_gate import NoRoom
+@@ -129,17 +131,25 @@
+ 
+     def _loop(self) -> None:
+         while True:
+-            self._yield()
+-            idle = not self.decoder.live() and self.held is None
+-            first = self.waiting.get() if idle else None                              # idle: wait for a request
+-            if idle and first is None:
+-                return                                                                # close()
+-            done = self._admit(first)
++            # Every call in a round but decoder.round() was unguarded: one raise ended this daemon
++            # thread for good, and with it the whole endpoint - /health stayed green while every
++            # later request hung forever on an open stream. A round that fails is a bad round.
+             try:
+-                done += self.decoder.round()
+-            except Exception as exc:                 # noqa: BLE001  (the live requests fail)
+-                for s in self.decoder.drop():
+-                    self._reply(s, "error", exc)
+-            self.decoder.finish(done)
+-            for s in done:
+-                self._reply(s, *(("error", s.error) if s.error is not None else ("done", s.stats())))
++                self._yield()
++                idle = not self.decoder.live() and self.held is None
++                first = self.waiting.get() if idle else None                          # idle: wait for a request
++                if idle and first is None:
++                    return                                                            # close()
++                done = self._admit(first)
++                try:
++                    done += self.decoder.round()
++                except Exception as exc:                 # noqa: BLE001  (the live requests fail)
++                    for s in self.decoder.drop():
++                        self._reply(s, "error", exc)
++                self.decoder.finish(done)
++                for s in done:
++                    self._reply(s, *(("error", s.error) if s.error is not None else ("done", s.stats())))
++            except Exception as exc:                     # noqa: BLE001  (the worker outlives the round)
++                print(f"[tensorfold] scheduler round failed, continuing: {exc!r}", flush=True)
++                traceback.print_exc()
++                time.sleep(0.05)
