@@ -25,6 +25,58 @@ appears in it.**
 | 4 | `EXL3_QC_PF_TWO_PASS_MIN_Q` | `256` | Query-length threshold for the prefill attention staging pass: below it the direct path reads less gmem (short trailing chunks over long contexts, low bitrates) | **Prefill is the known bottleneck** (~941 tok/s vs 2425 on the MLX engine). This directly selects a prefill attention path |
 | 5 | `EXL3_MOE_RECON_ROWS` / `_BATCH` / `_MB` | `16384` / `16` / `256` | Padded rows per group, batch size, and dequantised weight scratch budget for the reconstruct tier | Only matters if #2/#3 push more experts into reconstruct, so sweep together |
 
+### Correction: most of that table is not runtime-tunable in this build
+
+**Three of the five rows above cannot be swept on the current binary.** Verified by intersecting
+`getenv("EXL3_...")` in `exllamav3/exllamav3_ext/` with the strings in the `.so` the engine actually
+loads (`exllamav3-spec/exllamav3_ext.cpython-312-aarch64-linux-gnu.so`):
+
+| Row | Knob | In the loaded `.so`? |
+|---|---|---|
+| 1 | `EXL3_MOE_TILE_N` | **yes** |
+| 2 | `EXL3_MOE_FUSED_ROWS` | no |
+| 3 | `EXL3_MOE_FUSED_ROWS_WIDE` | no |
+| 4 | `EXL3_QC_PF_TWO_PASS_MIN_Q` | no |
+| 5 | `EXL3_MOE_RECON_ROWS` / `_BATCH` / `_MB` | no |
+
+Setting the missing ones is a silent no-op — the run looks like a sweep and measures nothing.
+
+The real runtime surface is 18 knobs. Swept, against a 1,004 tok/s prefill baseline at a 40k prompt:
+
+| Setting | Prefill | vs default |
+|---|---:|---:|
+| default | **1,004** | — |
+| `EXL3_MOE_TILE_N=128` | 957 | −4.7% |
+| `EXL3_HGEMM_F16ACC=1` | 931 | −7.3% |
+| `EXL3_QT_OPTIMIZED=1` | 955 | −4.9% |
+
+All worse. `EXL3_MOE_COOP_KSPLIT` is documented in its own source as "Measured ineffective", and
+`EXL3_HGEMM_F16ACC`'s auto path already benchmarks the fp16-accumulator MMA and declines it on parts
+where it is not ≥1.5x faster, which is why forcing it loses.
+
+### The prefill lever that did work: `CHUNK_SIZE`
+
+Not an engine variable at all — TabbyAPI's `chunk_size`, passed through as the engine's
+`max_chunk_size`, i.e. the M dimension of every prefill GEMM. It had been hardcoded at 4096.
+
+| `CHUNK_SIZE` | Prefill | Decode (4-class mean) | Resident |
+|---:|---:|---:|---:|
+| 4096 | 1,004 | 52.0 | 101 GiB |
+| **8192** | **1,145** | 51.9 | 103 GiB |
+| 16384 | — | — | refused by the autosplit headroom check |
+
+**+14% prefill, decode unchanged, +2 GiB.** Two independent runs agree (1116–1129, 1116–1154).
+16384 needs memory freed (`NGRAM_RAM=false` releases 18 GiB) before it will load.
+
+Note it is *also* `max_rq_tokens`:
+
+```python
+self.max_rq_tokens = self.chunk_size if output_chunking else None
+```
+
+so doubling it halves the requeue count and the associated re-prefill waste — a second effect in the
+same direction, not measured separately.
+
 ### How to run them
 
 One variable at a time, same session, paired against the current config. The whole point of the

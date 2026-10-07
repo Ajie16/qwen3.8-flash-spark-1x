@@ -155,6 +155,36 @@ cd exllamav3-tabby
 模型放在 `state/models/`，`tabby-config.yml` 里的 `model_name` 指向它。
 详见 [`exllamav3-tabby/README.md`](exllamav3-tabby/README.md)。
 
+#### `CHUNK_SIZE`（prefill 分块）—— 默认 8192
+
+prefill 是这套引擎的结构性瓶颈（~1,000 tok/s，而 MLX 引擎 2,425 —— trellis 反量化是
+**逐 token 计算**，吃不进 tensor core）。**不需要重编译的唯一杠杆就是 prefill 分块**，
+它同时是每个 prefill GEMM 的 M 维（TabbyAPI 的 `chunk_size` → 引擎的 `max_chunk_size`）。
+
+实测（40k 冷 prompt，服务端 `prompt_tokens_per_sec`）：
+
+| `CHUNK_SIZE` | prefill | decode（四类均值） | 常驻内存 |
+|---:|---:|---:|---:|
+| 4096 | 1,004 t/s | 52.0 t/s | 101 GiB |
+| **8192（默认）** | **1,145 t/s** | 51.9 t/s | 103 GiB |
+| 16384 | — | — | 加载被 autosplit 拒绝 |
+
+**+14% prefill，decode 无变化，内存 +2 GiB。**
+
+三个要注意的地方：
+
+1. **它同时是 requeue 阈值**——`backends/exllamav3/model.py` 里
+   `self.max_rq_tokens = self.chunk_size if output_chunking else None`。
+   加倍分块 = requeue 次数减半，重 prefill 的浪费也随之减少。
+2. **16384 在这台机器上装不下**（`NGRAM_RAM=true` 时）。报错是误导性的
+   `Insufficient VRAM in split for model and cache` ——真实原因是 autosplit 的余量预检
+   主动抛 OOM、异常被吞、单卡没有下一块设备可切。**要上 16384 得先腾内存**
+   （`NGRAM_RAM=false` 能释放 18 GiB）。
+3. **启动时的内存估算已包含 chunk 工作区**（`check_memory`），会随 `CHUNK_SIZE` 变化。
+   但它仍**只是下界**——注意力与 MoE 暂存没有建模，所以 16384 的算术明明够却被拒。
+
+改回去：`CHUNK_SIZE=4096 bash exllamav3-tabby/serve-local.sh`。
+
 ### 路线 B（TensorFold）
 
 ```bash
