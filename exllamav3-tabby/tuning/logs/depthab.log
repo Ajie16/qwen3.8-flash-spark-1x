@@ -1,0 +1,8 @@
+# 2026-09-17T16:36:34-07:00 523ecd3  400 new tokens, code task, greedy, -ndt 5 -dds 0.6
+RESULT K=4 prompt=4,115 cache=8,192 quant=fp16 prefill=921 t/s (4.5s) decode=66.6 t/s accept=281/453 new=410 needle=n/a peak_host=101.1GiB
+RESULT K=4 prompt=4,115 cache=8,192 quant=8,8 prefill=886 t/s (4.6s) decode=69.8 t/s accept=283/458 new=410 needle=n/a peak_host=100.8GiB
+RESULT K=128 prompt=128,116 cache=143,360 quant=fp16 prefill=1,175 t/s (109.0s) decode=66.6 t/s accept=275/400 new=400 needle=n/a peak_host=105.7GiB
+RESULT K=128 prompt=128,116 cache=143,360 quant=8,8 prefill=1,124 t/s (114.0s) decode=69.5 t/s accept=277/404 new=400 needle=n/a peak_host=103.9GiB
+RESULT K=240 prompt=240,115 cache=266,240 quant=fp16 prefill=1,165 t/s (206.0s) decode=65.1 t/s accept=274/398 new=400 needle=n/a peak_host=109.7GiB
+RESULT K=240 prompt=240,115 cache=266,240 quant=8,8 prefill=1,112 t/s (215.9s) decode=72.0 t/s accept=288/408 new=400 needle=n/a peak_host=106.6GiB
+# done 2026-09-17T16:53:14-07:00

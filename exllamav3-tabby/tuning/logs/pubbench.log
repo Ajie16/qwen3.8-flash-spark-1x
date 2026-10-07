@@ -1,0 +1,15 @@
+# 2026-09-17T14:07:58-07:00  host=spark-7e8b  commit=4d78f0a  dirty=3
+# config: EXL3_INT8_GEMV=0 EXL3_MOE_COOP_WIDE=1 EXL3_NGRAM_STREAM=0, big cores, greedy, 400 tok, cold load
+patches-off_ndt5       code    -mtp -ndt 5                      NO_TPS  [ERRORS IN LOG]
+patches-off_dds0.6     code    -mtp -ndt 5 -dds -dc 0.6         NO_TPS
+patches-on_ndt5        code    -mtp -ndt 5                      NO_TPS
+patches-on_dds0.6      code    -mtp -ndt 5 -dds -dc 0.6         NO_TPS
+patches-off_ndt5       devops  -mtp -ndt 5                      NO_TPS
+patches-off_dds0.6     devops  -mtp -ndt 5 -dds -dc 0.6         NO_TPS
+patches-on_ndt5        devops  -mtp -ndt 5                      NO_TPS
+patches-on_dds0.6      devops  -mtp -ndt 5 -dds -dc 0.6         NO_TPS
+patches-off_ndt5       prose   -mtp -ndt 5                      NO_TPS
+patches-off_dds0.6     prose   -mtp -ndt 5 -dds -dc 0.6         NO_TPS
+patches-on_ndt5        prose   -mtp -ndt 5                      NO_TPS  [ERRORS IN LOG]
+patches-on_dds0.6      prose   -mtp -ndt 5 -dds -dc 0.6         NO_TPS
+# done 2026-09-17T14:17:32-07:00

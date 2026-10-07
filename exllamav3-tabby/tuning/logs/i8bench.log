@@ -1,0 +1,12 @@
+# 2026-09-17T14:29:32-07:00 commit=4d78f0a
+int8-off_dds   code    [32;1m400[0m tokens at [32;1m73.80[0m t/s - Draft: [32;1m291[0m / [32;1m398[0m accepted ([32;1m73.12[0m%)
+int8-on_dds    code    [32;1m400[0m tokens at [32;1m78.95[0m t/s - Draft: [32;1m291[0m / [32;1m399[0m accepted ([32;1m72.93[0m%)
+int8-off_dds   devops  [32;1m400[0m tokens at [32;1m55.52[0m t/s - Draft: [32;1m242[0m / [32;1m433[0m accepted ([32;1m55.89[0m%)
+int8-on_dds    devops  [32;1m400[0m tokens at [32;1m62.49[0m t/s - Draft: [32;1m250[0m / [32;1m422[0m accepted ([32;1m59.24[0m%)
+int8-off_dds   prose   [32;1m400[0m tokens at [32;1m48.87[0m t/s - Draft: [32;1m209[0m / [32;1m453[0m accepted ([32;1m46.14[0m%)
+int8-on_dds    prose   [32;1m400[0m tokens at [32;1m52.97[0m t/s - Draft: [32;1m215[0m / [32;1m471[0m accepted ([32;1m45.65[0m%)
+int8-off_dds2  code    [32;1m400[0m tokens at [32;1m74.14[0m t/s - Draft: [32;1m291[0m / [32;1m398[0m accepted ([32;1m73.12[0m%)
+int8-on_dds2   code    [32;1m400[0m tokens at [32;1m79.28[0m t/s - Draft: [32;1m291[0m / [32;1m399[0m accepted ([32;1m72.93[0m%)
+int8-off_dds2  prose   [32;1m400[0m tokens at [32;1m49.00[0m t/s - Draft: [32;1m209[0m / [32;1m453[0m accepted ([32;1m46.14[0m%)
+int8-on_dds2   prose   [32;1m400[0m tokens at [32;1m53.02[0m t/s - Draft: [32;1m215[0m / [32;1m471[0m accepted ([32;1m45.65[0m%)
+# done 2026-09-17T14:39:17-07:00

@@ -1,0 +1,10 @@
+# 2026-09-17T15:18:56-07:00 commit=523ecd3
+# host free before: 118 GiB avail
+32768                   min_host_avail= 33431 MB  Context: [32;1m44[0m new tokens at [32;1m197.69[0m t/s - [32;1m0[0m tokens cached - Generate: [32;1m60
+131072                  min_host_avail= 30280 MB  Context: [32;1m44[0m new tokens at [32;1m202.20[0m t/s - [32;1m0[0m tokens cached - Generate: [32;1m60
+262144                  min_host_avail= 26470 MB  Context: [32;1m44[0m new tokens at [32;1m201.85[0m t/s - [32;1m0[0m tokens cached - Generate: [32;1m60
+262144   -cq 8,8        min_host_avail= 29510 MB  Context: [32;1m44[0m new tokens at [32;1m39.93[0m t/s - [32;1m0[0m tokens cached - Generate: [32;1m60[
+524288                  min_host_avail= 18622 MB  Context: [32;1m44[0m new tokens at [32;1m206.66[0m t/s - [32;1m0[0m tokens cached - Generate: [32;1m60
+524288   -cq 8,8        min_host_avail= 24979 MB  Context: [32;1m44[0m new tokens at [32;1m188.88[0m t/s - [32;1m0[0m tokens cached - Generate: [32;1m60
+1048576  -cq 8,8        min_host_avail= 15219 MB  Context: [32;1m44[0m new tokens at [32;1m189.60[0m t/s - [32;1m0[0m tokens cached - Generate: [32;1m60
+# done 2026-09-17T15:25:17-07:00

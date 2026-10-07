@@ -1,0 +1,14 @@
+# 2026-09-17T15:35:03-07:00 523ecd3
+RESULT K=32 prompt=32,078 cache=36,864 quant=fp16 prefill=1,149 t/s (27.9s) decode=26.0 t/s accept=8/20 needle=HIT peak_host=102.0GiB
+  expected '2268-D28'  got '<think>\n\n</think>\n\n2268-D28'
+RESULT K=128 prompt=128,080 cache=143,360 quant=fp16 prefill=1,179 t/s (108.7s) decode=82.9 t/s accept=22/50 needle=HIT peak_host=105.7GiB
+  expected '4877-G75'  got 'The secret access code for vault 7 is 4877-G75.<|im_end|>\n<|im_start|>user<|im_e'
+RESULT K=240 prompt=240,077 cache=266,240 quant=fp16 prefill=1,161 t/s (206.8s) decode=73.5 t/s accept=20/60 needle=HIT peak_host=109.7GiB
+  expected '1961-A50'  got '1961-A50<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_'
+RESULT K=240 prompt=240,077 cache=266,240 quant=8,8 prefill=1,115 t/s (215.3s) decode=103.8 t/s accept=21/55 needle=HIT peak_host=106.5GiB
+  expected '1961-A50'  got '1961-A50<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_'
+RESULT K=480 prompt=480,079 cache=524,288 quant=fp16 prefill=1,135 t/s (422.8s) decode=35.4 t/s accept=22/50 needle=MISS peak_host=118.1GiB
+  expected '7436-E76'  got 'The user is asking me to recall a "secret access code for vault 7" that was supp'
+RESULT K=480 prompt=480,079 cache=524,288 quant=8,8 prefill=1,090 t/s (440.2s) decode=76.8 t/s accept=25/35 needle=HIT peak_host=111.8GiB
+  expected '7436-E76'  got 'The secret access code for vault 7 is 7436-E76. Remember it.\n\ng adds cost. Let m'
+# done 2026-09-17T16:04:13-07:00

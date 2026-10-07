@@ -1,0 +1,10 @@
+# 2026-09-17T16:09:34-07:00
+RESULT K=300 prompt=300,078 cache=335,872 quant=fp16 prefill=1,162 t/s (258.2s) decode=48.8 t/s accept=22/50 needle=MISS peak_host=111.8GiB
+  expected '4289-A71'  got '<|im_end|>\n<|im_start|>assistant\n<think>\nThe user is asking me to reveal a "secr'
+RESULT K=300 prompt=300,078 cache=335,872 quant=8,8 prefill=1,116 t/s (269.0s) decode=70.3 t/s accept=22/50 needle=MISS peak_host=107.9GiB
+  expected '4289-A71'  got '<|im_end|>\n<|im_start|>assistant\n<think>\nThe user is asking me to reveal a "secr'
+RESULT K=480 prompt=480,077 cache=524,288 quant=fp16 prefill=1,136 t/s (422.5s) decode=38.0 t/s accept=20/60 needle=MISS peak_host=118.1GiB
+  expected '4672-A79'  got 'The user is asking for the secret access code for vault 7. Looking through the p'
+RESULT K=480 prompt=480,077 cache=524,288 quant=8,8 prefill=1,089 t/s (440.6s) decode=43.2 t/s accept=20/60 needle=MISS peak_host=111.7GiB
+  expected '4672-A79'  got 'The user is asking for the secret access code for vault 7. Looking through the p'
+# done 2026-09-17T16:36:21-07:00

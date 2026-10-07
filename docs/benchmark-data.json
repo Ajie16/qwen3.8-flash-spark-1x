@@ -1,0 +1,237 @@
+{
+  "schema_version": 2,
+  "model": "Qwen3.8-Flash-Next",
+  "pack": "turboderp/Qwen3.8-Flash-Next-exl3",
+  "pack_revision": "3.05bpw_h5_ng5",
+  "updated": "2026-09-14",
+  "source_commit": "943d6625dec9c5067a412ae14a351733b0829a06",
+  "source_url": "https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe/blob/943d6625dec9c5067a412ae14a351733b0829a06/README.md",
+  "recipe_url": "https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe",
+  "hardware": {
+    "name": "NVIDIA DGX Spark / GB10",
+    "unified_memory_gb": 128,
+    "visible_gib": 121.7
+  },
+  "current": {
+    "configured_context": 262144,
+    "vllm_runtime": "vLLM 0.29.0 + vllm-exl3 0.4.2; disk-backed n-gram mode requires vllm-exl3 main 94c29ba or newer",
+    "model_resident_gib": 79.0,
+    "ngram_resident_gib": 30.4,
+    "kv_pool_tokens": 416163,
+    "max_context_concurrency": 1.6,
+    "mem_available_gib": "17–18",
+    "draft_depth": [
+      {
+        "label": "No draft",
+        "k": 0,
+        "decode_4k": 27.77,
+        "decode_32k": 27.58
+      },
+      {
+        "label": "MTP k=2",
+        "k": 2,
+        "decode_4k": 47.39,
+        "decode_32k": 46.6
+      },
+      {
+        "label": "MTP k=3",
+        "k": 3,
+        "decode_4k": 50.09,
+        "decode_32k": 49.73
+      }
+    ],
+    "context_curve": [
+      {
+        "prompt_tokens": 3060,
+        "decode_tok_s": 52.22,
+        "tokens_per_chunk": 3.03
+      },
+      {
+        "prompt_tokens": 24354,
+        "decode_tok_s": 50.53,
+        "tokens_per_chunk": 2.98
+      },
+      {
+        "prompt_tokens": 97362,
+        "decode_tok_s": 48.13,
+        "tokens_per_chunk": 2.88
+      },
+      {
+        "prompt_tokens": 148569,
+        "decode_tok_s": 50.72,
+        "tokens_per_chunk": 2.91
+      },
+      {
+        "prompt_tokens": 156018,
+        "decode_tok_s": 51.98,
+        "tokens_per_chunk": 2.91
+      },
+      {
+        "prompt_tokens": 163506,
+        "decode_tok_s": 53.14,
+        "tokens_per_chunk": 2.86
+      },
+      {
+        "prompt_tokens": 163818,
+        "decode_tok_s": 51.76,
+        "tokens_per_chunk": 2.86
+      },
+      {
+        "prompt_tokens": 164091,
+        "decode_tok_s": 21.99,
+        "tokens_per_chunk": 1.0
+      },
+      {
+        "prompt_tokens": 178287,
+        "decode_tok_s": 21.95,
+        "tokens_per_chunk": 1.0
+      },
+      {
+        "prompt_tokens": 208005,
+        "decode_tok_s": 21.94,
+        "tokens_per_chunk": 1.0
+      },
+      {
+        "prompt_tokens": 252582,
+        "decode_tok_s": 21.3,
+        "tokens_per_chunk": 1.0
+      }
+    ],
+    "mtp_cliff_prompt_tokens": 163840,
+    "no_draft_long_context_tok_s": 26.59,
+    "cold_prefill_tok_s": "1,075–1,180",
+    "prefix_cache": {
+      "prompt_tokens": 196010,
+      "cold_ttft_s": 178.72,
+      "same_doc_new_question_ttft_s": 2.33,
+      "same_doc_new_question_cached_pct": 98.9,
+      "identical_repeat_ttft_s": 1.56,
+      "identical_repeat_cached_pct": 99.3
+    },
+    "concurrency_short": [
+      {
+        "streams": 1,
+        "mtp_k3_steady": 54.8,
+        "no_draft_steady": 29.0
+      },
+      {
+        "streams": 2,
+        "mtp_k3_steady": 89.4,
+        "no_draft_steady": 49.1
+      },
+      {
+        "streams": 4,
+        "mtp_k3_steady": 155.6,
+        "no_draft_steady": 87.2
+      },
+      {
+        "streams": 8,
+        "mtp_k3_steady": 157.6,
+        "no_draft_steady": 153.4
+      }
+    ],
+    "concurrency_3k": [
+      {
+        "streams": 1,
+        "mtp_k3_steady": 53.2,
+        "no_draft_steady": 28.7
+      },
+      {
+        "streams": 2,
+        "mtp_k3_steady": 79.6,
+        "no_draft_steady": 46.0
+      },
+      {
+        "streams": 4,
+        "mtp_k3_steady": 102.9,
+        "no_draft_steady": 63.0
+      },
+      {
+        "streams": 8,
+        "mtp_k3_steady": 90.5,
+        "no_draft_steady": 73.1
+      }
+    ],
+    "native_exllamav3": {
+      "version": "1.5.0",
+      "single_stream_k3_tok_s": 58.8,
+      "eight_stream_aggregate_tok_s": 152.0,
+      "vllm_single_stream_same_sweep_tok_s": 54.8,
+      "vllm_eight_stream_same_sweep_tok_s": 157.6,
+      "tuned_gb10": {
+        "date": "2026-09-17",
+        "fork_commit": "523ecd3",
+        "harness": "examples/chat.py, cold load, greedy, 400 new tokens, -mtp -ndt 5 -dds -dc 0.6 -cq 8,8 -cs 262144",
+        "code_tok_s": 79,
+        "devops_tok_s": 62,
+        "prose_tok_s": 53,
+        "no_draft_tok_s": 33,
+        "acceptance": {
+          "code": 0.73,
+          "devops": 0.59,
+          "prose": 0.46
+        },
+        "levers": [
+          "EXL3_GR_INT8=1 int8 hyperconnection mixers (fp16 in the pack)",
+          "EXL3_INT8_GEMV=0",
+          "EXL3_MOE_COOP_WIDE=1",
+          "big-core affinity",
+          "-ndt 5 -dds -dc 0.6",
+          "EXL3_MTP_HEAD_N=65536",
+          "-cq 8,8 8-bit KV (+3 at 4k, +7 at 240k)"
+        ],
+        "context": {
+          "launcher_cs": 262144,
+          "ceiling": "262144 (trained window; needle exact at 240k, fails at 300k and 480k; host memory 118/121 GiB at 480k)",
+          "decode_at_depth_400tok_code": {
+            "4k": {
+              "fp16": 66.6,
+              "kv8": 69.8
+            },
+            "128k": {
+              "fp16": 66.6,
+              "kv8": 69.5
+            },
+            "240k": {
+              "fp16": 65.1,
+              "kv8": 72.0
+            }
+          },
+          "prefill_tok_s": "~1150 flat to 480k"
+        }
+      },
+      "note": "Native ExLlamaV3 is the leaner/faster single-user path; tuned for GB10 it is 79 tok/s on code against 52 through vLLM. vLLM + vllm-exl3 provides OpenAI-compatible serving, parsers, structured output, prefix caching and broader vLLM tooling out of the box."
+    },
+    "revision_405": {
+      "pack_revision": "4.05bpw_h6_ng6",
+      "disk_gb": 107.5,
+      "resident": {
+        "max_context": 131072,
+        "gpu_util": 0.92,
+        "kv_pool_tokens": 195509,
+        "mem_available_gib": 3.4,
+        "decode_4k": 48.7,
+        "decode_32k": 51.31,
+        "prefill_24k": 1137
+      },
+      "disk_ngram": {
+        "max_context": 262144,
+        "gpu_util": 0.8,
+        "kv_pool_tokens": 954453,
+        "context_concurrency": 3.64,
+        "mem_available_gib": "18–20",
+        "decode_4k": 41.1,
+        "decode_32k": 47.9,
+        "no_draft_4k": 24.4,
+        "prefill_24k": 1128
+      },
+      "note": "Keeping the packed n-gram table on NVMe makes the higher-precision revision a real 262K one-Spark configuration, at a decode cost from PIECEWISE-only graphs plus first-touch page-ins."
+    }
+  },
+  "methodology": {
+    "decode": "Completion tokens after the first token divided by decode wall time; TTFT excluded.",
+    "cold_prefill": "Unique prefix per request; verified with vLLM prefix-cache hit counters.",
+    "concurrency": "Steady aggregate counts tokens only over the interval where every stream is decoding.",
+    "scope": "Recorded measurements only. No browser-side inference. Historical Sep 7/8 results remain in the repository README, but this benchmark page intentionally presents the current Sep 13/14 serving envelope only."
+  }
+}

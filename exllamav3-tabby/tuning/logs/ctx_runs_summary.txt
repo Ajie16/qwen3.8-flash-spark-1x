@@ -1,0 +1,81 @@
+prompt tokens 128,080  cache 143,360  needle depth 39%  quant=fp16
+loaded in 32s, host used 101.8 GiB
+RESULT K=128 prompt=128,080 cache=143,360 quant=fp16 prefill=1,179 t/s (108.7s) decode=82.9 t/s accept=22/50 needle=HIT peak_host=105.7GiB
+  expected '4877-G75'  got 'The secret access code for vault 7 is 4877-G75.<|im_end|>\n<|im_start|>user<|im_e'
+
+
+prompt tokens 240,077  cache 266,240  needle depth 22%  quant=fp16
+loaded in 32s, host used 105.2 GiB
+RESULT K=240 prompt=240,077 cache=266,240 quant=fp16 prefill=1,161 t/s (206.8s) decode=73.5 t/s accept=20/60 needle=HIT peak_host=109.7GiB
+  expected '1961-A50'  got '1961-A50<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_'
+
+prompt tokens 240,077  cache 266,240  needle depth 22%  quant=8,8
+loaded in 32s, host used 104.1 GiB
+RESULT K=240 prompt=240,077 cache=266,240 quant=8,8 prefill=1,115 t/s (215.3s) decode=103.8 t/s accept=21/55 needle=HIT peak_host=106.5GiB
+  expected '1961-A50'  got '1961-A50<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_'
+
+prompt tokens 300,078  cache 335,872  needle depth 18%  quant=fp16
+loaded in 32s, host used 108.9 GiB
+RESULT K=300 prompt=300,078 cache=335,872 quant=fp16 prefill=1,162 t/s (258.2s) decode=48.8 t/s accept=22/50 needle=MISS peak_host=111.8GiB
+  expected '4289-A71'  got '<|im_end|>\n<|im_start|>assistant\n<think>\nThe user is asking me to reveal a "secr'
+
+prompt tokens 300,078  cache 335,872  needle depth 18%  quant=8,8
+loaded in 32s, host used 105.2 GiB
+RESULT K=300 prompt=300,078 cache=335,872 quant=8,8 prefill=1,116 t/s (269.0s) decode=70.3 t/s accept=22/50 needle=MISS peak_host=107.9GiB
+  expected '4289-A71'  got '<|im_end|>\n<|im_start|>assistant\n<think>\nThe user is asking me to reveal a "secr'
+
+prompt tokens 32,078  cache 36,864  needle depth 34%  quant=fp16
+loaded in 31s, host used 100.9 GiB
+RESULT K=32 prompt=32,078 cache=36,864 quant=fp16 prefill=1,149 t/s (27.9s) decode=26.0 t/s accept=8/20 needle=HIT peak_host=102.0GiB
+  expected '2268-D28'  got '<think>\n\n</think>\n\n2268-D28'
+
+prompt tokens 480,079  cache 524,288  needle depth 63%  quant=fp16
+loaded in 37s, host used 114.7 GiB
+RESULT K=480 prompt=480,079 cache=524,288 quant=fp16 prefill=1,135 t/s (422.8s) decode=35.4 t/s accept=22/50 needle=MISS peak_host=118.1GiB
+  expected '7436-E76'  got 'The user is asking me to recall a "secret access code for vault 7" that was supp'
+
+prompt tokens 480,079  cache 524,288  needle depth 63%  quant=8,8
+loaded in 33s, host used 106.5 GiB
+RESULT K=480 prompt=480,079 cache=524,288 quant=8,8 prefill=1,090 t/s (440.2s) decode=76.8 t/s accept=25/35 needle=HIT peak_host=111.8GiB
+  expected '7436-E76'  got 'The secret access code for vault 7 is 7436-E76. Remember it.\n\ng adds cost. Let m'
+
+prompt tokens 480,077  cache 524,288  needle depth 61%  quant=8,8
+loaded in 32s, host used 108.2 GiB
+RESULT K=480 prompt=480,077 cache=524,288 quant=8,8 prefill=1,089 t/s (440.6s) decode=43.2 t/s accept=20/60 needle=MISS peak_host=111.7GiB
+  expected '4672-A79'  got 'The user is asking for the secret access code for vault 7. Looking through the p'
+
+prompt tokens 480,077  cache 524,288  needle depth 61%  quant=fp16
+loaded in 33s, host used 112.8 GiB
+RESULT K=480 prompt=480,077 cache=524,288 quant=fp16 prefill=1,136 t/s (422.5s) decode=38.0 t/s accept=20/60 needle=MISS peak_host=118.1GiB
+  expected '4672-A79'  got 'The user is asking for the secret access code for vault 7. Looking through the p'
+
+prompt tokens 128,116  cache 143,360  needle depth 19%  quant=fp16
+loaded in 31s, host used 103.4 GiB
+RESULT K=128 prompt=128,116 cache=143,360 quant=fp16 prefill=1,175 t/s (109.0s) decode=66.6 t/s accept=275/400 new=400 needle=n/a peak_host=105.7GiB
+  expected '1589-C30'  got '```python\nimport re\nfrom datetime import datetime\nfrom typing import Dict, Optio'
+
+prompt tokens 128,116  cache 143,360  needle depth 19%  quant=8,8
+loaded in 31s, host used 101.0 GiB
+RESULT K=128 prompt=128,116 cache=143,360 quant=8,8 prefill=1,124 t/s (114.0s) decode=69.5 t/s accept=277/404 new=400 needle=n/a peak_host=103.9GiB
+  expected '1589-C30'  got '```python\nimport re\nfrom datetime import datetime\nfrom typing import Dict, Optio'
+
+prompt tokens 240,115  cache 266,240  needle depth 66%  quant=fp16
+loaded in 32s, host used 107.3 GiB
+RESULT K=240 prompt=240,115 cache=266,240 quant=fp16 prefill=1,165 t/s (206.0s) decode=65.1 t/s accept=274/398 new=400 needle=n/a peak_host=109.7GiB
+  expected '9184-G23'  got '```python\nimport re\nfrom datetime import datetime\nfrom typing import Dict, Optio'
+
+prompt tokens 240,115  cache 266,240  needle depth 66%  quant=8,8
+loaded in 32s, host used 102.1 GiB
+RESULT K=240 prompt=240,115 cache=266,240 quant=8,8 prefill=1,112 t/s (215.9s) decode=72.0 t/s accept=288/408 new=400 needle=n/a peak_host=106.6GiB
+  expected '9184-G23'  got '```python\nimport re\nfrom datetime import datetime\nfrom typing import Dict, Optio'
+
+prompt tokens 4,115  cache 8,192  needle depth 55%  quant=fp16
+loaded in 32s, host used 99.5 GiB
+RESULT K=4 prompt=4,115 cache=8,192 quant=fp16 prefill=921 t/s (4.5s) decode=66.6 t/s accept=281/453 new=410 needle=n/a peak_host=101.1GiB
+  expected '6041-E21'  got '<|im_end|>\n<|im_start|>assistant<think>\nThe user is asking me to write a Python '
+
+prompt tokens 4,115  cache 8,192  needle depth 55%  quant=8,8
+loaded in 32s, host used 98.0 GiB
+RESULT K=4 prompt=4,115 cache=8,192 quant=8,8 prefill=886 t/s (4.6s) decode=69.8 t/s accept=283/458 new=410 needle=n/a peak_host=100.8GiB
+  expected '6041-E21'  got '<|im_end|>\n<|im_start|>assistant<think>\nThe user is asking me to write a Python '
+

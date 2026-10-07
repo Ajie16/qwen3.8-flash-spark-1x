@@ -1,0 +1,29 @@
+ -- Loading /home/darkmatter/models/Qwen3.8-Flash-Next-EXL3
+
+ -- Loading /home/darkmatter/models/Qwen3.8-Flash-Next-EXL3
+
+ -- Loading tokenizer...
+ -- Total size: 84,440,817,444 bytes, 78.64 GB
+ -- Load time: 23.158 seconds
+ -- Overhead: 8.006 seconds
+ -- Bandwidth: 3.396 GB/s  /  2.523 GB/s
+ -- Deferred: 302,721 tensors in 56 passes, 303,463 chunks
+ -- Direct: 568 tensors
+
+[37;1mYou are a helpful AI assistant.[0m
+
+[34;1mAssistant: [0mThe wind didn’t just blow on Ketchikan’s outermost spit; it screamed, a jagged, metallic shriek that tore through the night like a banshee’s wail. Elias, a man whose skin had weathered into the texture of driftwood, pressed his forehead against the cold glass of the lantern room. Below, the Pacific churned into a frothing chaos of black and white, swallowing the horizon whole. For forty years, he had tended this light, a solitary sentinel against the encroaching dark, but tonight, the storm felt personal. It felt hungry.
+
+When dawn finally broke, bruised and purple, the sea had retreated, leaving behind a jagged scar of debris along the rocky shoreline. Elias descended the spiral stairs, his boots heavy with exhaustion, and stepped out into the biting chill. The air smelled of ozone, salt, and something else—something sweet and cloying, like rotting orchids.
+
+He scanned the wreckage: shattered timber, tangled kelp, and the usual flotsam of the ocean’s indifference. Then, he saw it. Nestled in a crevice of basalt, half-buried in sand, was not a crate or a body, but a piano.
+
+It was a grand piano, its ebony lacquer stripped away by the salt spray, revealing pale, splintered wood beneath. The lid was open, gaping like a mouth frozen in a silent scream. Elias approached cautiously, the crunch of gravel underfoot sounding obscenely loud in the sudden silence. He ran a calloused hand over the keys. They were intact, miraculously, though the ivory was yellowed and cracked.
+
+He pressed a middle C. The note rang out, clear and haunting, defying the dampness, defying the storm. It was a sound so pure it seemed to vibrate in his very bones. Elias looked around, expecting to see a shipwreck survivor, a musician,
+
+[31;1m !! Response exceeded 400 tokens and was cut short.[0m
+
+Context: [32;1m56[0m new tokens at [32;1m227.94[0m t/s - [32;1m0[0m tokens cached - Generate: [32;1m400[0m tokens at [32;1m46.26[0m t/s - Draft: [32;1m216[0m / [32;1m466[0m accepted ([32;1m46.35[0m%)
+[32;1m
+Info: [0mExiting

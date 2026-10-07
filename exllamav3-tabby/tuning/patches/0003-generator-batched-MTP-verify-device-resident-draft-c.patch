@@ -1,0 +1,214 @@
+From 4e8133fca194ee83e65391af832014899f2ad35a Mon Sep 17 00:00:00 2001
+From: Victor Cruz <vcruz305@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 15:00:33 -0700
+Subject: [PATCH 3/3] generator: batched MTP verify, device-resident draft
+ chain, pinned MTP block table
+
+Three host-side sync removals in the speculative loop, all default on:
+- EXL3_BATCH_VERIFY: one sampler call over all q verify positions and an
+  on-device draft compare with a single readback, instead of q .cpu() syncs.
+- EXL3_MTP_DEVICE_DRAFT (+ EXL3_EMBED_GPU mirror of the embedding table):
+  draft ids stay on the draft device between steps; no host round trip.
+- The MTP draft loop built its block table / cache_seqlens with pageable
+  torch.zeros, so every H2D upload was a blocking memcpy (1.65 ms x ndt per
+  round). Now pinned staging.
+
+In-process harness: host glue 8.4 -> 3.1 ms/round, +12 t/s. Through
+examples/chat.py the per-token console write is itself a host sync and the gain
+lands inside variance (+/-2 t/s on GB10); kept because in-process and server
+(TabbyAPI-class) callers see the full effect. 0 disables each.
+---
+ exllamav3/generator/generator.py | 80 +++++++++++++++++++++++++++-----
+ exllamav3/modules/embedding.py   | 25 +++++++++-
+ 2 files changed, 93 insertions(+), 12 deletions(-)
+
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index 45042ef..b17eda7 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -23,6 +23,10 @@ import threading
+ from ..tokenizer import MMEmbedding
+ from ..util import profile_opt
+ 
++import os as _os
++_BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
++_MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
++
+ class Generator:
+ 
+     def __init__(
+@@ -708,10 +712,13 @@ class Generator:
+         if batch_size == 0:
+             return None
+ 
+-        # Create block index table for batch
++        # Create block index table for batch (pinned staging, like iterate_gen: a pageable
++        # source makes every per-draft-step upload a blocking cudaMemcpy)
+         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
++        max_pages_batch = (max_pages_batch + 15) // 16 * 16
++        block_index = self._staging("mtp_block_index", batch_size, max_pages_batch)
++        block_index.zero_()
++        cache_seqlens = self._staging("mtp_cache_seqlens", batch_size)
+         batch = 0
+         for job in self.active_jobs:
+             if not job.is_prefill_done(): continue
+@@ -737,9 +744,18 @@ class Generator:
+             job_ids = job.get_input_ids_list()
+             input_ids_list += job_ids
+             mtp_hidden_list.append(job.mtp_last_hidden)
+-        batch_ids = self.draft_input_ids_pinned[:batch_size, :]
+-        batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
+         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
++        # Device-resident draft chain (EXL3_MTP_DEVICE_DRAFT): ids stay on the draft device
++        # between steps (the Embedding mirrors its table there), so the window costs one
++        # readback instead of one per drafted token
++        dev_draft = _MTP_DEVICE_DRAFT and self.draft_calibrator is None and temp_hidden.is_cuda
++        if dev_draft:
++            ddev = temp_hidden.device
++            batch_ids = torch.cat(input_ids_list, dim = 0).to(ddev, non_blocking = True)
++            dev_draft_ids = torch.empty((batch_size, self.num_draft_tokens), dtype = torch.long, device = ddev)
++        else:
++            batch_ids = self.draft_input_ids_pinned[:batch_size, :]
++            batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
+ 
+         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
+         # every row's running product of estimated conditional acceptance probabilities falls
+@@ -762,8 +778,12 @@ class Generator:
+             lm_head = self.model.modules[self.model.logit_layer_idx]
+             batch_state = lm_head.prepare_for_device(batch_state, params)
+             new_ids = self.draft_model.sample_from_state(batch_state, params)
+-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+-            batch_ids.copy_(new_ids)
++            if dev_draft:
++                dev_draft_ids[:, idx:idx+1] = new_ids
++                batch_ids = new_ids
++            else:
++                self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
++                batch_ids.copy_(new_ids)
+             cache_seqlens += 1
+             temp_hidden = batch_state
+             draft_conf = params.get("draft_conf")
+@@ -776,6 +796,11 @@ class Generator:
+                     window = idx + 1
+                     break
+ 
++        if dev_draft:
++            # one readback for the whole window
++            self.draft_ids_pinned[:batch_size, :window].copy_(dev_draft_ids[:, :window])
++            return self.draft_ids_pinned[:, :window]
++
+         if conf_cols and len(conf_cols) == window:
+             self._draft_conf_round = {
+                 "ids": self.draft_ids_pinned[:batch_size, :window],
+@@ -1146,11 +1171,42 @@ class Generator:
+                 accepted_length = 1
+                 rejected = 0
+ 
++                # Batched verify (EXL3_BATCH_VERIFY): sample every position of the verification
++                # window in one sampler call and compare against the draft on-device, so the
++                # round pays one launch->readback sync instead of one per position. Only for
++                # samplers whose per-position result does not depend on earlier positions in the
++                # same window (no past-id penalties, filters, forced tokens or prob exports)
++                pre_tokens = None
++                pre_match = None
++                if (
++                    _BATCH_VERIFY and draft_tokens is not None and batch_logits.shape[1] > 1 and
++                    len(job.sequences) == 1 and not job.filters and job.forced_ids is None and
++                    not job.return_probs and job.return_top_tokens == 0 and job.new_tokens >= 0 and
++                    not getattr(job.sampler, "reqs_past_ids", False) and job.device_logit_mask is None
++                ):
++                    q_ = batch_logits.shape[1]
++                    all_tokens = job.sampler.forward(
++                        job_logits.view(q_, 1, -1),
++                        None,
++                        job.rng.randint(0, (1<<32)-1),
++                        self.tokenizer,
++                        logit_mask = None
++                    ).view(q_)
++                    d_ = draft_tokens[j, :q_ - 1].to(all_tokens.device, non_blocking = True)
++                    match_ = (all_tokens[:q_ - 1] == d_)
++                    packed_ = torch.cat([all_tokens, match_.to(all_tokens.dtype)]).cpu()   # single sync
++                    pre_tokens = packed_[:q_]
++                    pre_match = packed_[q_:].tolist()
++
+                 for i in range(batch_logits.shape[1]):
+                     token_logits = job_logits[:, i:i + 1, :]
+-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+-                        token_logits,
+-                    )
++                    if pre_tokens is not None:
++                        next_token = pre_tokens[i:i + 1].view(1, 1)
++                        next_k_tokens = next_k_probs = next_prob = None
++                    else:
++                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
++                            token_logits,
++                        )
+                     eos, sampled_token, rq = job.receive_sample(
+                         token_logits,
+                         next_token,
+@@ -1205,7 +1261,9 @@ class Generator:
+                     # draft acceptance so state can be stashed at an exact page boundary.
+                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
+                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
++                        mismatch_ = (not pre_match[i]) if pre_match is not None else \
++                            (draft_tokens[j, i].item() != sampled_token.item())
++                        if mismatch_ or cp_boundary:
+                             rejected = reject_remainder(job, j, i, batch_states)
+                             break
+ 
+diff --git a/exllamav3/modules/embedding.py b/exllamav3/modules/embedding.py
+index d3f85ac..dc66fd5 100644
+--- a/exllamav3/modules/embedding.py
++++ b/exllamav3/modules/embedding.py
+@@ -8,6 +8,10 @@ from . import Module
+ from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+ from ..model.model_tp_alloc import TPAllocation
+ 
++import os as _os
++_EMBED_GPU = _os.environ.get("EXL3_EMBED_GPU", "1") != "0"
++_EMBED_GPU_MAX_MB = int(_os.environ.get("EXL3_EMBED_GPU_MAX_MB", "4096"))
++
+ class Embedding(Module):
+ 
+     def __init__(
+@@ -53,6 +57,11 @@ class Embedding(Module):
+             device = "meta"
+         )
+         self.embedding.weight = nn.Parameter(weight)
++        # Optional device mirror of the table so callers with cuda input_ids (the MTP draft
++        # chain) can embed without a host round trip. EXL3_EMBED_GPU=0 disables; default on
++        # for tables up to EXL3_EMBED_GPU_MAX_MB (4096)
++        self._gpu_mirror = None
++        self._gpu_mirror_dev = None
+ 
+     @override
+     def unload(self):
+@@ -145,7 +154,21 @@ class Embedding(Module):
+ 
+         # No indexed embeddings, or none in current batch
+         else:
+-            x = self.embedding.forward(x)
++            if x.device.type == "cuda" and self.device is not None and self.device.type == "cpu":
++                # cuda ids against a CPU-resident table: use (or build) the device mirror
++                if self._gpu_mirror is None or self._gpu_mirror_dev != x.device:
++                    self._gpu_mirror = None
++                    if _EMBED_GPU:
++                        w = self.embedding.weight.data
++                        if w.numel() * w.element_size() <= _EMBED_GPU_MAX_MB << 20:
++                            self._gpu_mirror = w.to(x.device, non_blocking = False)
++                            self._gpu_mirror_dev = x.device
++                if self._gpu_mirror is not None:
++                    x = torch.nn.functional.embedding(x, self._gpu_mirror)
++                else:
++                    x = self.embedding.forward(x.cpu())
++            else:
++                x = self.embedding.forward(x)
+             if self.multiplier != 1.0:
+                 x *= self.multiplier
+             x = to2(x, out_dtype, self.out_dtype)
+-- 
+2.50.1 (Apple Git-155)
+

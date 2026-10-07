@@ -1,0 +1,31 @@
+ -- Loading /home/darkmatter/models/Qwen3.8-Flash-Next-EXL3
+
+ -- Loading /home/darkmatter/models/Qwen3.8-Flash-Next-EXL3
+
+ -- Loading tokenizer...
+ -- Total size: 84,440,817,444 bytes, 78.64 GB
+ -- Load time: 23.294 seconds
+ -- Overhead: 8.076 seconds
+ -- Bandwidth: 3.376 GB/s  /  2.507 GB/s
+ -- Deferred: 302,721 tensors in 56 passes, 303,463 chunks
+ -- Direct: 568 tensors
+
+[37;1mYou are a helpful AI assistant.[0m
+
+[34;1mAssistant: [0mThe wind didn’t just blow on Ketchikan’s northernmost spit; it screamed, a jagged, icy shriek that tore through the gaps in Elias’s weathered coat. For thirty years, Elias had been the solitary guardian of the Black Rock Light, a sentinel of stone and glass perched on a jagged tooth of rock in the Bering Sea. He knew the rhythm of the tides better than his own heartbeat, and he knew that when the sky turned the color of bruised plums, the ocean brought gifts no one asked for.
+
+The storm had raged for three days, a whiteout fury that battered the lighthouse until the very foundations groaned. When the silence finally fell, heavy and suffocating, Elias stepped out onto the slick, black basalt. The air smelled of ozone and rotting kelp. The sea was a churning gray soup, receding slowly to reveal the debris of the night.
+
+He expected driftwood, tangled fishing nets, or perhaps the carcass of a seal. Instead, nestled in a cradle of tangled sea grass and shattered shells, lay a crate. It wasn’t the rotting wood of a century-old shipwreck, nor the plastic of modern pollution. It was polished mahogany, sealed with brass fittings that gleamed defiantly against the dull gray morning.
+
+Elias approached cautiously, his boots crunching on wet gravel. The crate was small, no larger than a breadbox, yet it seemed impossibly heavy. There was no label, no shipping mark, only a single symbol etched into the lid: a spiral eye, unblinking and ancient.
+
+His heart hammered against his ribs, a rare sensation for a man who had long ago traded fear for routine. He knelt, his arthritic fingers brushing the cold brass latch. It clicked open with a sound like a bone breaking.
+
+Inside, there was no gold, no jewels, no secret maps.
+
+[31;1m !! Response exceeded 400 tokens and was cut short.[0m
+
+Context: [32;1m56[0m new tokens at [32;1m226.94[0m t/s - [32;1m0[0m tokens cached - Generate: [32;1m400[0m tokens at [32;1m52.97[0m t/s - Draft: [32;1m215[0m / [32;1m471[0m accepted ([32;1m45.65[0m%)
+[32;1m
+Info: [0mExiting

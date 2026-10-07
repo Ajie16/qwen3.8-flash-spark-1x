@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Qwen3.8-Flash-Next EXL3 | Before → After on One DGX Spark</title>
+<meta name="description" content="Animated before-and-after benchmark presentation for Qwen3.8-Flash-Next EXL3 on one NVIDIA DGX Spark: 58.8 tok/s native, 157.6 tok/s vLLM aggregate, and full 262K context.">
+<meta name="theme-color" content="#040712">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Qwen3.8-Flash-Next EXL3 | Before → After">
+<meta property="og:description" content="From the earlier 47.6 tok/s / 64K serving baseline to 58.8 tok/s native, 157.6 tok/s aggregate, and full 262K context on one DGX Spark.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:creator" content="@ViC305">
+<style>
+:root{color-scheme:dark;--ink:#edf4ff;--muted:#9baccc;--edge:#314563;--cyan:#4de7ff;--mint:#7ff4ca;--violet:#a78bfa;--gold:#ffd166;--red:#ff6b86;--bg:#03060d}
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,Arial,sans-serif}
+button,select{font:inherit}button{cursor:pointer}
+#app{position:fixed;inset:0;overflow:hidden;background:radial-gradient(circle at 14% 8%,#113061 0,#07101f 30%,#02040a 74%)}
+#frame{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);overflow:hidden;box-shadow:0 24px 110px #000c;border:1px solid #243959;border-radius:18px}
+canvas{display:block;width:100%;height:100%;background:#07101f}
+#dock{position:absolute;left:50%;bottom:max(10px,env(safe-area-inset-bottom));transform:translateX(-50%);width:max-content;max-width:calc(100vw - 16px);padding:7px 10px;display:flex;align-items:center;justify-content:center;gap:7px;overflow-x:auto;overflow-y:hidden;white-space:nowrap;border:1px solid #344866;border-radius:14px;background:#0a1425ee;backdrop-filter:blur(16px);box-shadow:0 10px 42px #0009;z-index:8;scrollbar-width:none}
+#dock::-webkit-scrollbar{display:none}
+#dock button,#dock select{flex:0 0 auto;background:#18263e;color:#edf4ff;border:1px solid #3b4e6c;border-radius:8px;padding:8px 10px}
+#dock button:hover,#dock select:hover{border-color:var(--mint)}
+#dock button:focus-visible,#dock select:focus-visible{outline:3px solid var(--mint);outline-offset:2px}
+#dock .primary{background:linear-gradient(135deg,var(--cyan),var(--mint));border:0;color:#041319;font-weight:850}
+#dock .clock{font:12px ui-monospace,Consolas,monospace;color:#c2cee3;min-width:88px;text-align:center}
+#dock .sep{width:1px;height:26px;background:#3a4861}
+#hint{position:absolute;left:50%;transform:translateX(-50%);bottom:76px;text-align:center;font-size:11px;color:#7e8ead;white-space:nowrap;pointer-events:none;z-index:3}
+#progress{position:absolute;left:0;right:0;bottom:0;height:3px;background:#0f1b2d;z-index:7}#progress i{display:block;width:0;height:100%;background:linear-gradient(90deg,var(--cyan),var(--mint));box-shadow:0 0 12px #4de7ff99}
+#toast{position:absolute;left:50%;top:14px;transform:translateX(-50%);padding:9px 14px;border-radius:9px;background:#10223b;border:1px solid #42678a;color:#f2f7ff;opacity:0;pointer-events:none;transition:opacity .18s;z-index:12}.show{opacity:1!important}
+.clean #dock,.clean #hint,.clean #progress{display:none}.clean #frame{border:0;border-radius:0;box-shadow:none}.clean,.clean canvas{cursor:none}
+#countdown{display:none;position:absolute;inset:0;background:#02050bdc;backdrop-filter:blur(7px);z-index:10;align-items:center;justify-content:center;flex-direction:column}#countdown.on{display:flex}#countdown strong{font-size:clamp(72px,15vw,170px);color:var(--mint);line-height:1}#countdown span{margin-top:12px;color:#c8d5ec;text-transform:uppercase;letter-spacing:.18em}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+@media(max-width:900px){#dock{justify-content:flex-start}#dock .optional,#dock .sep,#dock .clock{display:none}#dock button,#dock select{font-size:12px;padding:7px 8px}#hint{display:none}#frame{border-radius:10px}}
+@media(prefers-reduced-motion:reduce){#toast{transition:none}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="frame"><canvas id="card" width="1920" height="1080" role="img" aria-label="Animated before and after benchmark results for Qwen3.8-Flash-Next EXL3 on one NVIDIA DGX Spark.">Canvas required.</canvas></div>
+  <div id="countdown"><strong id="count">3</strong><span>Before → After tour</span></div>
+  <div id="hint">16:9 landscape • Swipe or arrows • Space play/pause • F fullscreen • H controls</div>
+  <div id="progress"><i></i></div>
+  <nav id="dock" aria-label="Benchmark controls">
+    <select id="scene" aria-label="Scene">
+      <option value="0">01 · Headline</option>
+      <option value="1">02 · Speed</option>
+      <option value="2">03 · Context</option>
+      <option value="3">04 · Concurrency</option>
+      <option value="4">05 · Prefix cache</option>
+      <option value="5">06 · 4.05 bpw</option>
+      <option value="6">07 · Engine choice</option>
+    </select>
+    <button id="prev" title="Previous">◀</button>
+    <button id="next" title="Next">▶</button>
+    <button id="start" class="primary">Start 45.5s tour</button>
+    <button id="play">Play</button>
+    <span class="sep"></span>
+    <button id="full">Fullscreen</button>
+    <button id="png">Save PNG</button>
+    <button id="share" class="optional">Copy link</button>
+    <button id="hide" class="optional">Hide</button>
+    <span id="clock" class="clock">00:00.0 / 00:45.5</span>
+  </nav>
+  <div id="toast" role="status"></div>
+  <div id="status" class="sr" aria-live="polite"></div>
+</div>
+<script>
+(()=>{
+const W=1920,H=1080,SEG=6500,SCENES=7,TOTAL=SEG*SCENES;
+const app=document.getElementById('app'),frame=document.getElementById('frame'),canvas=document.getElementById('card'),ctx=canvas.getContext('2d');
+const $=id=>document.getElementById(id);
+const C={bg:'#06101f',panel:'#0b182c',panel2:'#0e2038',edge:'#294563',white:'#f4f8ff',muted:'#9eb0cd',cyan:'#4de7ff',mint:'#7ff4ca',violet:'#a78bfa',gold:'#ffd166',red:'#ff6b86',dim:'#60718e'};
+const names=['overview','speed','context','scale','cache','revision','engines'];
+const aliases={sweep:'speed',long:'context',cliff:'context',native:'engines'};
+let state={scene:0,playing:false,tour:false,clean:false,elapsed:0,sceneStart:0,last:0,raf:0,loop:false};
+const clamp=(x,a=0,b=1)=>Math.max(a,Math.min(b,x));
+const ease=x=>1-Math.pow(1-clamp(x),3);
+const phase=(p,a,b)=>ease((p-a)/(b-a));
+const lerp=(a,b,t)=>a+(b-a)*t;
+function rgba(hex,a){const h=hex.replace('#','');const n=parseInt(h.length===3?h.split('').map(c=>c+c).join(''):h,16);return`rgba(${n>>16},${n>>8&255},${n&255},${a})`}
+function rr(x,y,w,h,r){ctx.beginPath();ctx.roundRect(x,y,w,h,r)}
+function panel(x,y,w,h,stroke=C.edge,fill=C.panel,a=1){ctx.save();ctx.globalAlpha=a;rr(x,y,w,h,24);ctx.fillStyle=fill;ctx.fill();ctx.strokeStyle=stroke;ctx.lineWidth=2;ctx.stroke();ctx.restore()}
+function line(x1,y1,x2,y2,color=C.edge,width=2,a=1){ctx.save();ctx.globalAlpha=a;ctx.strokeStyle=color;ctx.lineWidth=width;ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();ctx.restore()}
+function text(x,y,s,size=30,color=C.white,weight=600,align='left',family='system-ui',a=1){ctx.save();ctx.globalAlpha=a;ctx.font=`${weight} ${size}px ${family}`;ctx.fillStyle=color;ctx.textAlign=align;ctx.textBaseline='alphabetic';ctx.fillText(s,x,y);ctx.restore()}
+function label(x,y,s,color=C.cyan,size=19,a=1){text(x,y,s.toUpperCase(),size,color,820,'left','system-ui',a)}
+function paragraph(x,y,lines,size=24,color=C.muted,lh=1.38,a=1){lines.forEach((s,i)=>text(x,y+i*size*lh,s,size,color,500,'left','system-ui',a))}
+function header(k,title,sub,scene,a=1){label(84,82,k,C.cyan,19,a);text(84,154,title,66,C.white,900,'left','system-ui',a);if(sub)text(86,202,sub,25,C.muted,520,'left','system-ui',a);line(84,226,1836,226,rgba(C.cyan,.28),2,a);footer(scene)}
+function footer(scene){text(84,1045,'ONE NVIDIA DGX SPARK · RECORDED RESULTS · SEP 13–14, 2026',15,'#7489aa',600);text(1835,1045,`${scene+1} / ${SCENES}`,16,'#7489aa',700,'right')}
+function num(x,y,v,size,color,a=1,digits=1,suffix=''){text(x,y,`${Number(v).toFixed(digits)}${suffix}`,size,color,900,'left','ui-monospace, SFMono-Regular, Menlo, monospace',a)}
+function chip(x,y,w,s,color=C.cyan,a=1){ctx.save();ctx.globalAlpha=a;rr(x,y,w,43,22);ctx.fillStyle=rgba(color,.10);ctx.fill();ctx.strokeStyle=rgba(color,.55);ctx.lineWidth=1.5;ctx.stroke();ctx.restore();text(x+w/2,y+29,s,17,color,760,'center','system-ui',a)}
+function arrow(x1,y,x2,p,color=C.mint){const t=ease(p),xe=lerp(x1,x2,t);line(x1,y,xe,y,color,7,t);if(t>.8){ctx.save();ctx.globalAlpha=(t-.8)/.2;ctx.fillStyle=color;ctx.beginPath();ctx.moveTo(x2,y);ctx.lineTo(x2-30,y-18);ctx.lineTo(x2-30,y+18);ctx.closePath();ctx.fill();ctx.restore()}}
+function comparePanel(x,y,w,h,title,value,unit,sub,color,a=1){panel(x,y,w,h,rgba(color,.55),rgba(color,.055),a);label(x+30,y+42,title,color,18,a);text(x+30,y+132,value,72,color,900,'left','ui-monospace, SFMono-Regular, Menlo, monospace',a);text(x+30+Math.max(210,value.length*45),y+132,unit,27,C.white,700,'left','system-ui',a);text(x+30,y+177,sub,20,C.muted,520,'left','system-ui',a)}
+function bar(x,y,w,h,p,color=C.cyan){rr(x,y,w,h,h/2);ctx.fillStyle='#13233a';ctx.fill();rr(x,y,w*clamp(p),h,h/2);ctx.fillStyle=color;ctx.fill();ctx.shadowColor=color;ctx.shadowBlur=16;ctx.fill();ctx.shadowBlur=0}
+function background(time){const g=ctx.createLinearGradient(0,0,W,H);g.addColorStop(0,'#0a1730');g.addColorStop(.48,'#050a15');g.addColorStop(1,'#070513');ctx.fillStyle=g;ctx.fillRect(0,0,W,H);const glow=ctx.createRadialGradient(1560,160,20,1560,160,650);glow.addColorStop(0,'rgba(77,231,255,.15)');glow.addColorStop(1,'rgba(77,231,255,0)');ctx.fillStyle=glow;ctx.fillRect(0,0,W,H);ctx.save();ctx.globalAlpha=.06;ctx.strokeStyle='#7aa7df';ctx.lineWidth=1;for(let x=-H;x<W+H;x+=72){ctx.beginPath();ctx.moveTo(x+(time%720)/10,0);ctx.lineTo(x-H+(time%720)/10,H);ctx.stroke()}ctx.restore()}
+function beforeAfterTitle(p){const a=phase(p,0,.18),b=phase(p,.2,.6);chip(1390,72,340,'BEFORE → AFTER',C.mint,b);return[a,b]}
+function overview(p){header('THE UPDATE','Qwen3.8-Flash-Next EXL3','The same one-Spark recipe, now mapped from the old public baseline to the current serving envelope.',0);const [a,b]=beforeAfterTitle(p);comparePanel(90,300,650,265,'BEFORE · PUBLIC BASELINE','47.6','tok/s','Greedy p50 · 64K configured context',C.dim,a);comparePanel(1180,300,650,265,'NOW · NATIVE EXLLAMAV3','58.8','tok/s','Fastest measured single-stream path',C.mint,b);arrow(780,430,1135,phase(p,.16,.55),C.mint);comparePanel(90,625,650,235,'BEFORE · MULTI-USER','Not mapped','','Concurrency was not characterized correctly',C.dim,phase(p,.08,.28));comparePanel(1180,625,650,235,'NOW · VLLM','157.6','tok/s','8-stream steady aggregate',C.cyan,phase(p,.45,.82));arrow(780,742,1135,phase(p,.46,.82),C.cyan);chip(700,906,520,'FULL 262,144 CONTEXT ON ONE SPARK',C.violet,phase(p,.62,.95));}
+function speed(p){header('SINGLE-STREAM SPEED','MTP k=3 replaced the old k=2 recommendation','The current fixed build is faster, and direct ExLlamaV3 gives the leanest one-user path.',1);const a=phase(p,0,.28),b=phase(p,.27,.65),c=phase(p,.55,.9);panel(92,292,1736,570);label(135,342,'BEFORE · SEP 7 BUILD',C.dim,18,a);text(135,395,'MTP k=2',31,C.white,750,'left','system-ui',a);bar(135,424,630,34,a*.784,C.dim);num(790,454,39.21,42,C.dim,a,2,'');text(940,452,'tok/s mean',24,C.muted,600,'left','system-ui',a);label(135,528,'CURRENT · VLLM',C.cyan,18,b);text(135,581,'MTP k=3',31,C.white,750,'left','system-ui',b);bar(135,610,800,34,b*.835,C.cyan);num(965,640,50.09,42,C.cyan,b,2,'');text(1118,638,'tok/s @ 4K',24,C.muted,600,'left','system-ui',b);label(135,718,'CURRENT · NATIVE EXLLAMAV3',C.mint,18,c);bar(135,760,930,39,c*.98,C.mint);num(1100,799,58.8,49,C.mint,c,1,'');text(1270,796,'tok/s',27,C.white,700,'left','system-ui',c);text(1360,796,'single stream',23,C.muted,600,'left','system-ui',c);chip(1315,360,430,'CURRENT VLLM: 49.73 tok/s @ 32K',C.violet,b);chip(1315,425,430,'NO DRAFT: 27.77 tok/s',C.gold,b);paragraph(1315,535,['Native is the fastest lean path.','vLLM stays near 50–55 tok/s while','adding the complete serving stack.'],22,C.muted,1.35,c);}
+function contextScene(p){header('CONTEXT + CACHE','From 64K configured to the full 262K ceiling','The model now boots at its native context, and cached long-document turns avoid repeating the cold prefill.',2);const a=phase(p,0,.25),b=phase(p,.22,.58),c=phase(p,.56,.9);comparePanel(90,300,650,245,'BEFORE · CONFIGURED CONTEXT','65,536','tokens','Earlier public serving baseline',C.dim,a);comparePanel(1180,300,650,245,'NOW · CONFIGURED CONTEXT','262,144','tokens','Full model ceiling · 4× larger',C.violet,b);arrow(780,420,1135,phase(p,.2,.58),C.violet);panel(90,610,1740,280,rgba(C.cyan,.38),'#09172a',c);label(130,660,'196K-TOKEN DOCUMENT · TIME TO FIRST TOKEN',C.cyan,20,c);text(130,737,'178.72 s',55,C.red,900,'left','ui-monospace',c);text(425,737,'cold',24,C.muted,650,'left','system-ui',c);arrow(570,718,815,phase(p,.62,.8),C.mint);text(870,737,'2.33 s',55,C.cyan,900,'left','ui-monospace',c);text(1085,737,'new question',24,C.muted,650,'left','system-ui',c);arrow(1260,718,1455,phase(p,.74,.9),C.mint);text(1510,737,'1.56 s',55,C.mint,900,'left','ui-monospace',c);text(1510,778,'identical repeat',21,C.muted,600,'left','system-ui',c);text(130,842,'Important: 163,840 is a prompt-token MTP acceptance cliff, not the model context limit.',22,C.gold,720,'left','system-ui',c);}
+function scaleScene(p){header('CONCURRENCY','The old two-stream “plateau” was the metric, not the engine','Correct steady-state decode nearly doubles the apparent ceiling.',3);const a=phase(p,0,.3),b=phase(p,.28,.75);comparePanel(90,300,690,270,'OLD · SUPERSEDED WINDOW METRIC','~78','tok/s','2 streams · chunked prefill polluted the window',C.dim,a);comparePanel(1140,300,690,270,'NOW · STEADY DECODE','157.6','tok/s','8 streams · short prompts',C.cyan,b);arrow(825,430,1095,phase(p,.25,.7),C.cyan);panel(90,635,1740,245);label(130,682,'CURRENT MTP k=3 · STEADY AGGREGATE',C.mint,19,b);const vals=[54.8,89.4,155.6,157.6];const labs=['1 stream','2 streams','4 streams','8 streams'];vals.forEach((v,i)=>{const x=130+i*410;const pp=phase(p,.42+i*.07,.73+i*.06);text(x,742,labs[i],20,C.muted,650,'left','system-ui',pp);bar(x,765,315,30,pp*(v/165),i>1?C.mint:C.cyan);text(x,842,v.toFixed(1),42,i>1?C.mint:C.cyan,900,'left','ui-monospace',pp)});}
+function cacheScene(p){header('BEFORE → AFTER EXPERIENCE','Prefix caching changes the long-context workflow','The cold first turn is expensive. Reusing the document prefix makes follow-up turns practical.',4);const a=phase(p,0,.27),b=phase(p,.25,.58),c=phase(p,.55,.86);panel(90,310,540,475,rgba(C.red,.45),rgba(C.red,.045),a);label(130,360,'BEFORE · COLD DOCUMENT',C.red,18,a);text(130,475,'178.72',92,C.red,900,'left','ui-monospace',a);text(455,475,'sec',31,C.white,700,'left','system-ui',a);text(130,535,'0.0% cached',25,C.muted,650,'left','system-ui',a);paragraph(130,610,['Novel 196K-token prefix.','Full prefill is computed once.'],22,C.muted,1.4,a);arrow(665,540,875,phase(p,.22,.52),C.mint);panel(900,310,420,475,rgba(C.cyan,.55),rgba(C.cyan,.045),b);label(940,360,'AFTER · NEW QUESTION',C.cyan,18,b);text(940,475,'2.33',92,C.cyan,900,'left','ui-monospace',b);text(1180,475,'sec',31,C.white,700,'left','system-ui',b);text(940,535,'98.9% cached',25,C.muted,650,'left','system-ui',b);paragraph(940,610,['Same document,','different question.'],22,C.muted,1.4,b);arrow(1355,540,1450,phase(p,.5,.72),C.mint);panel(1480,310,350,475,rgba(C.mint,.6),rgba(C.mint,.05),c);label(1515,360,'REPEAT',C.mint,18,c);text(1515,475,'1.56',82,C.mint,900,'left','ui-monospace',c);text(1718,475,'sec',29,C.white,700,'left','system-ui',c);text(1515,535,'99.3% cached',23,C.muted,650,'left','system-ui',c);text(1515,640,'Work skipped,',22,C.muted,600,'left','system-ui',c);text(1515,675,'not recomputed.',22,C.muted,600,'left','system-ui',c);chip(590,850,740,'THE 180-SECOND COST IS FIRST TURN, NOT EVERY TURN',C.gold,phase(p,.7,.95));}
+function revisionScene(p){header('4.05 BPW REVISION','Resident table → NVMe-backed table','Moving the packed n-gram table off-device trades some decode speed for full context and much more KV headroom.',5);const a=phase(p,0,.25),b=phase(p,.24,.67);panel(90,285,760,615,rgba(C.red,.35),rgba(C.red,.035),a);label(135,340,'BEFORE · TABLE RESIDENT',C.red,18,a);const left=[['Max context','131,072'],['KV pool','195,509'],['MemAvailable','3.4 GiB'],['Decode @ 32K','51.31 tok/s']];left.forEach((r,i)=>{text(135,420+i*104,r[0],23,C.muted,600,'left','system-ui',a);text(790,420+i*104,r[1],32,i===3?C.gold:C.white,820,'right','ui-monospace',a);line(135,448+i*104,790,448+i*104,C.edge,1,a)});panel(1070,285,760,615,rgba(C.mint,.55),rgba(C.mint,.045),b);label(1115,340,'AFTER · TABLE ON NVMe',C.mint,18,b);const right=[['Max context','262,144'],['KV pool','954,453'],['MemAvailable','18–20 GiB'],['Decode @ 32K','47.9 tok/s']];right.forEach((r,i)=>{text(1115,420+i*104,r[0],23,C.muted,600,'left','system-ui',b);text(1770,420+i*104,r[1],32,i===3?C.gold:C.mint,820,'right','ui-monospace',b);line(1115,448+i*104,1770,448+i*104,C.edge,1,b)});arrow(885,580,1035,phase(p,.2,.65),C.mint);chip(640,935,640,'131K → 262K · 195K → 954K KV TOKENS',C.violet,phase(p,.56,.9));}
+function enginesScene(p){header('CHOOSE THE SERVING PATH','Native speed or full API stack','Both use the same EXL3 pack. The right engine depends on the workload.',6);const a=phase(p,0,.38),b=phase(p,.26,.72);panel(90,285,800,640,rgba(C.mint,.55),rgba(C.mint,.04),a);label(135,340,'DIRECT EXLLAMAV3 1.5.0',C.mint,19,a);text(135,450,'58.8 tok/s',78,C.mint,900,'left','ui-monospace',a);paragraph(135,535,['Fastest measured single-user path','Loads in under a minute','Leaves more memory free'],23,C.white,1.55,a);line(135,690,840,690,C.edge,1,a);text(135,745,'For an OpenAI-compatible API,',21,C.muted,600,'left','system-ui',a);text(135,780,'add a serving layer such as TabbyAPI.',21,C.gold,700,'left','system-ui',a);panel(1030,285,800,640,rgba(C.cyan,.55),rgba(C.cyan,.04),b);label(1075,340,'vLLM + vllm-exl3',C.cyan,19,b);text(1075,435,'54.8 tok/s',69,C.cyan,900,'left','ui-monospace',b);text(1075,485,'single stream',22,C.muted,650,'left','system-ui',b);text(1075,570,'157.6 tok/s',66,C.mint,900,'left','ui-monospace',b);text(1075,616,'8-stream aggregate',22,C.muted,650,'left','system-ui',b);paragraph(1075,700,['OpenAI-compatible API out of the box','Reasoning + tool-call parsers','Structured output · prefix cache · batching'],21,C.white,1.48,b);chip(565,960,790,'NATIVE FOR LEAN SPEED · vLLM FOR COMPLETE SERVING',C.violet,phase(p,.66,.95));}
+const draws=[overview,speed,contextScene,scaleScene,cacheScene,revisionScene,enginesScene];
+function draw(scene=state.scene,p=1,time=0){ctx.save();background(time);draws[scene](p);ctx.restore()}
+function layout(){const vw=app.clientWidth||innerWidth,vh=app.clientHeight||innerHeight;const dockH=state.clean?0:($('dock').offsetHeight+46);const pad=state.clean?0:18;const scale=Math.max(.06,Math.min((vw-pad)/W,(vh-dockH-pad)/H));frame.style.width=(W*scale)+'px';frame.style.height=(H*scale)+'px';frame.style.top=((vh-dockH)/2)+'px';frame.style.left='50%';}
+function setScene(i,final=true){state.scene=(i+SCENES)%SCENES;state.playing=false;state.tour=false;state.elapsed=0;$('scene').value=String(state.scene);draw(state.scene,final?1:0,performance.now());sync();announce();updateUrl()}
+function sync(){const sec=state.tour?state.elapsed/1000:(state.playing?Math.min(SEG,(performance.now()-state.sceneStart))/1000:0);$('clock').textContent=`00:${sec.toFixed(1).padStart(4,'0')} / 00:${(TOTAL/1000).toFixed(1)}`;$('play').textContent=state.playing?'Pause':'Play';$('progress').firstElementChild.style.width=((state.tour?state.elapsed/TOTAL:(state.scene+(state.playing?sec/(SEG/1000):1))/SCENES)*100)+'%'}
+function announce(){$('status').textContent=`Scene ${state.scene+1} of ${SCENES}: ${names[state.scene]}`}
+function animate(now){if(!state.last)state.last=now;const dt=now-state.last;state.last=now;if(state.playing){if(state.tour){state.elapsed+=dt;if(state.elapsed>=TOTAL){if(state.loop)state.elapsed%=TOTAL;else{state.elapsed=TOTAL;state.playing=false;state.tour=false;state.scene=0;draw(0,1,now);sync();return}}state.scene=Math.min(SCENES-1,Math.floor(state.elapsed/SEG));const p=(state.elapsed%SEG)/SEG;draw(state.scene,p,now)}else{const t=now-state.sceneStart;const p=clamp(t/SEG);draw(state.scene,p,now);if(p>=1)state.playing=false}sync()}state.raf=requestAnimationFrame(animate)}
+function playScene(){state.tour=false;state.playing=!state.playing;state.sceneStart=performance.now();state.last=0;if(state.playing)draw(state.scene,0,0);sync()}
+function startTour(){let n=3;$('count').textContent=n;$('countdown').classList.add('on');const timer=setInterval(()=>{n--;if(n>0){$('count').textContent=n;return}clearInterval(timer);$('countdown').classList.remove('on');state.scene=0;state.elapsed=0;state.tour=true;state.playing=true;state.last=0;state.clean=true;app.classList.add('clean');layout();draw(0,0,0);sync()},1000)}
+function toggleClean(v=!state.clean){state.clean=v;app.classList.toggle('clean',v);layout()}
+function updateUrl(){try{const u=new URL(location.href);u.searchParams.set('scene',names[state.scene]);history.replaceState(null,'',u)}catch{}}
+function initialScene(){const q=new URLSearchParams(location.search);let n=q.get('scene')||'overview';n=aliases[n]||n;const i=names.indexOf(n);state.scene=i>=0?i:0;state.clean=q.get('clean')==='1';app.classList.toggle('clean',state.clean);$('scene').value=String(state.scene);if(q.get('autoplay')==='1')setTimeout(startTour,450);else draw(state.scene,1,0)}
+function savePng(){draw(state.scene,1,0);const a=document.createElement('a');a.download=`qwen_before_after_${names[state.scene]}_1920x1080.png`;a.href=canvas.toDataURL('image/png');a.click()}
+function toast(s){$('toast').textContent=s;$('toast').classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').classList.remove('show'),2400)}
+async function copyLink(){const u=new URL(location.href);u.searchParams.set('scene',names[state.scene]);try{await navigator.clipboard.writeText(u.href);toast('Scene link copied')}catch{toast(u.href)}}
+async function fullscreen(){try{if(!document.fullscreenElement)await app.requestFullscreen();else await document.exitFullscreen()}catch(e){toast('Fullscreen requires a browser gesture')}layout()}
+$('scene').onchange=e=>setScene(Number(e.target.value));$('prev').onclick=()=>setScene(state.scene-1);$('next').onclick=()=>setScene(state.scene+1);$('play').onclick=playScene;$('start').onclick=startTour;$('full').onclick=fullscreen;$('png').onclick=savePng;$('share').onclick=copyLink;$('hide').onclick=()=>toggleClean(true);
+addEventListener('resize',layout);document.addEventListener('fullscreenchange',layout);document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')setScene(state.scene+1);if(e.key==='ArrowLeft')setScene(state.scene-1);if(e.key===' ') {e.preventDefault();playScene()}if(e.key.toLowerCase()==='f')fullscreen();if(e.key.toLowerCase()==='h')toggleClean();if(e.key.toLowerCase()==='r')startTour();if(/[1-7]/.test(e.key))setScene(Number(e.key)-1)});
+let sx=0,sy=0;canvas.addEventListener('touchstart',e=>{sx=e.touches[0].clientX;sy=e.touches[0].clientY},{passive:true});canvas.addEventListener('touchend',e=>{const dx=e.changedTouches[0].clientX-sx,dy=e.changedTouches[0].clientY-sy;if(Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy))setScene(state.scene+(dx<0?1:-1))},{passive:true});
+window.benchmarkStudio={render:(i,p=1)=>{state.scene=i;draw(i,p,0)},clean:toggleClean,sceneNames:names};
+initialScene();layout();sync();announce();requestAnimationFrame(animate);
+})();
+</script>
+</body>
+</html>

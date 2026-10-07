@@ -1,0 +1,412 @@
+From d7d03b13271679d76d73a69203dc3abce93bed17 Mon Sep 17 00:00:00 2001
+From: Victor Cruz <vcruz305@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 15:00:33 -0700
+Subject: [PATCH 1/3] hc_mix: int8-weight GatedResidual decode mixer kernels
+ (EXL3_GR_INT8=1)
+
+The hyperconnection mixers (GatedResidual.fn_h / upx_h) are fp16 in an otherwise
+3-bit pack: 3.2 GB resident on Qwen3.8-Flash-Next, 13.2 MB per site x 96 sites =
+1.27 GB read per decode round, ~20% of the round on GB10 at ~44% of spec
+bandwidth (each (M+1, R) block re-reads its weight row per stream).
+
+Store them as int8 with per-row fp32 scales, quantized at load. gr_dots_i8 /
+gr_finalize_i8 are the fp16 kernels with only the weight load changed: the scale
+is constant along the contracted dim so it factors out of the k-loop, and the
+fmaf chains and reduction order are byte-identical. The fp16 fused-path copies
+are freed (1.6 GB back); the prefill path (proj_h / up_h) is untouched.
+
+Measured on GB10, chat.py cold greedy 400 tok, -mtp -ndt 5 -dds -dc 0.6:
+  code   74.0 -> 79.1 t/s   acceptance 73.1 -> 72.9%
+  devops 55.5 -> 62.5 t/s              55.9 -> 59.2%
+  prose  49.0 -> 53.0 t/s              46.1 -> 45.7%
+Kernel parity vs fp32 torch on the dequantized weights: 1-2e-4 rel (mixed),
+~1e-7 (post), R = 1..8. Isolated per-call 1.14-1.34x. Greedy trajectories
+diverge from fp16 at token 157 / 34 / 14 (code / devops / prose); int8 was
+chosen over int6 for lane-aligned loads and over int4 because a simulated int4
+mixer collapsed acceptance to 20%.
+
+Default off (EXL3_GR_INT8=1 enables) pending a second box's numbers.
+---
+ exllamav3/exllamav3_ext/bindings.cpp  |   1 +
+ exllamav3/exllamav3_ext/hc_mix.cu     | 256 ++++++++++++++++++++++++++
+ exllamav3/exllamav3_ext/hc_mix.cuh    |  14 ++
+ exllamav3/modules/hyperconnections.py |  35 +++-
+ 4 files changed, 304 insertions(+), 2 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index 1594d70..e662c73 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -118,6 +118,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
+     m.def("hc_apply", &hc_apply, "hc_apply");
+     m.def("gr_mix", &gr_mix, "gr_mix");
++    m.def("gr_mix_int8", &gr_mix_int8, "gr_mix_int8");
+     m.def("routing_std", &routing_std, "routing_std");
+     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
+ 
+diff --git a/exllamav3/exllamav3_ext/hc_mix.cu b/exllamav3/exllamav3_ext/hc_mix.cu
+index 2e53ae3..e9fdbae 100644
+--- a/exllamav3/exllamav3_ext/hc_mix.cu
++++ b/exllamav3/exllamav3_ext/hc_mix.cu
+@@ -468,6 +468,195 @@ void gr_finalize_kernel
+ }
+ 
+ 
++
++// ---------------------------------------------------------------------------------------------
++// int8-weight variants (EXL3_GR_INT8). Same math and reduction order as gr_dots_kernel /
++// gr_finalize_kernel; only the weight load differs: int8 x per-row fp32 scale instead of half.
++// fn_q: (M, H * D) int8, fn_s: (M) float   -- row j dequantizes as fn_q[j, :] * fn_s[j]
++// up_q: (H, D / 4, LR, 4) int8, up_s: (H, D) float -- channel (h, d) scale, constant over LR
++// Because each scale is constant along the contracted dim, it factors out of the k-loop:
++//   sum_k s[k] * (q[k] * scale) == scale * sum_k s[k] * q[k]   (exact in real arithmetic; in
++// fp32 the rounding pattern differs slightly from multiplying inside the loop, but this is the
++// SAME trajectory whether the reference is "fp16 kernel on dequantized weights" or not -- the
++// reference to compare against is gr_parity's fp32 torch path on the dequantized weights).
++
++template <int H>
++__global__ __launch_bounds__(GR_THREADS_A)
++void gr_dots_i8_kernel
++(
++    const float* __restrict__ streams,   // (R, H, D)
++    const int8_t* __restrict__ fn_q,     // (M, H * D) int8
++    const float* __restrict__ fn_s,      // (M) per-row scale
++    float* __restrict__ dots,            // (R, M + 1, H)
++    const int M,
++    const int D
++)
++{
++    const int r = blockIdx.y;
++    const int j = blockIdx.x;
++    const int D4 = D / 4;
++    const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
++
++    __shared__ float red[H][GR_THREADS_A / 32];
++    const int lane = threadIdx.x % 32;
++    const int warp = threadIdx.x / 32;
++    const float sj = (j < M) ? fn_s[j] : 1.0f;
++
++    #pragma unroll
++    for (int h = 0; h < H; ++h)
++    {
++        float a = 0.0f;
++        if (j < M)
++        {
++            // 8-byte int8 loads (8 weights) against two 16-byte stream quads: same 8-wide
++            // step as the half kernel's 16-byte load, half the weight bytes
++            const int2* f8 = (const int2*) (fn_q + ((size_t) j * H + h) * D);
++            for (int c = threadIdx.x; c < D4 / 2; c += GR_THREADS_A)
++            {
++                float4 s0 = s4[(size_t) h * D4 + 2 * c];
++                float4 s1 = s4[(size_t) h * D4 + 2 * c + 1];
++                int2 pk = f8[c];
++                const int8_t* q = (const int8_t*) &pk;
++                a = fmaf(s0.x, (float) q[0], a);
++                a = fmaf(s0.y, (float) q[1], a);
++                a = fmaf(s0.z, (float) q[2], a);
++                a = fmaf(s0.w, (float) q[3], a);
++                a = fmaf(s1.x, (float) q[4], a);
++                a = fmaf(s1.y, (float) q[5], a);
++                a = fmaf(s1.z, (float) q[6], a);
++                a = fmaf(s1.w, (float) q[7], a);
++            }
++        }
++        else
++        {
++            for (int c = threadIdx.x; c < D4; c += GR_THREADS_A)
++            {
++                float4 s = s4[(size_t) h * D4 + c];
++                a = fmaf(s.x, s.x, fmaf(s.y, s.y, fmaf(s.z, s.z, fmaf(s.w, s.w, a))));
++            }
++        }
++        for (int offset = 16; offset > 0; offset >>= 1)
++            a += __shfl_down_sync(0xffffffffu, a, offset);
++        if (lane == 0) red[h][warp] = a;
++    }
++    __syncthreads();
++    if (threadIdx.x < H)
++    {
++        float v = 0.0f;
++        #pragma unroll
++        for (int w = 0; w < GR_THREADS_A / 32; ++w)
++            v += red[threadIdx.x][w];
++        dots[((size_t) r * (M + 1) + j) * H + threadIdx.x] = v * sj;
++    }
++}
++
++template <int H, bool HALF_OUT>
++__global__ __launch_bounds__(NUM_THREADS)
++void gr_finalize_i8_kernel
++(
++    const float* __restrict__ streams,   // (R, H, D)
++    const float* __restrict__ dots,      // (R, M + 1, H)
++    const int8_t* __restrict__ up_q,     // (H, D / 4, LR, 4) int8
++    const float* __restrict__ up_s,      // (H, D) per-channel scale
++    const half* __restrict__ w,          // (H * D) half norm weight
++    float* __restrict__ post,
++    void* __restrict__ mixed,
++    const int D,
++    const int LR,
++    const int chunk_cols,
++    const float rms_eps
++)
++{
++    const int r = blockIdx.y;
++    const int M = LR + (post ? H : 0);
++    const float* dr = dots + (size_t) r * (M + 1) * H;
++
++    __shared__ float rmr_s[H];
++    extern __shared__ float t_s[];
++    if (threadIdx.x < H)
++        rmr_s[threadIdx.x] = rsqrtf(dr[(size_t) M * H + threadIdx.x] / (float) D + rms_eps);
++    __syncthreads();
++    const float inv_h = 1.0f / (float) H;
++    for (int i = threadIdx.x; i < LR; i += NUM_THREADS)
++    {
++        float v = 0.0f;
++        #pragma unroll
++        for (int h = 0; h < H; ++h)
++            v = fmaf(rmr_s[h], dr[(size_t) i * H + h], v);
++        v *= inv_h;
++        t_s[i] = v * sigmoidf_(v);
++    }
++    if (post && blockIdx.x == 0 && threadIdx.x < H)
++    {
++        float v = 0.0f;
++        #pragma unroll
++        for (int h = 0; h < H; ++h)
++            v = fmaf(rmr_s[h], dr[(size_t) (LR + threadIdx.x) * H + h], v);
++        post[(size_t) r * H + threadIdx.x] = 2.0f * sigmoidf_(v * inv_h);
++    }
++    __syncthreads();
++
++    const int c0 = blockIdx.x * chunk_cols;
++    const int c1 = min(c0 + chunk_cols, D);
++    const int D4 = D / 4;
++    const int lane = threadIdx.x % 32;
++    const int warp = threadIdx.x / 32;
++    const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
++    for (int c = c0 / 4 + warp; c < c1 / 4; c += NUM_THREADS / 32)
++    {
++        float4 g[H];
++        #pragma unroll
++        for (int h = 0; h < H; ++h) g[h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++        for (int i = lane; i < LR; i += 32)
++        {
++            float ti = t_s[i];
++            #pragma unroll
++            for (int h = 0; h < H; ++h)
++            {
++                // (H, D/4, LR, 4) int8: consecutive lanes read consecutive 4-byte quads
++                int u = *(const int*) (up_q + ((((size_t) h * (D / 4) + c) * LR + i) * 4));
++                const int8_t* q = (const int8_t*) &u;
++                g[h].x = fmaf(ti, (float) q[0], g[h].x);
++                g[h].y = fmaf(ti, (float) q[1], g[h].y);
++                g[h].z = fmaf(ti, (float) q[2], g[h].z);
++                g[h].w = fmaf(ti, (float) q[3], g[h].w);
++            }
++        }
++        #pragma unroll
++        for (int h = 0; h < H; ++h)
++            for (int offset = 16; offset > 0; offset >>= 1)
++            {
++                g[h].x += __shfl_xor_sync(0xffffffffu, g[h].x, offset);
++                g[h].y += __shfl_xor_sync(0xffffffffu, g[h].y, offset);
++                g[h].z += __shfl_xor_sync(0xffffffffu, g[h].z, offset);
++                g[h].w += __shfl_xor_sync(0xffffffffu, g[h].w, offset);
++            }
++        if (lane != 0) continue;
++        float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++        #pragma unroll
++        for (int h = 0; h < H; ++h)
++        {
++            float4 s = s4[(size_t) h * D4 + c];
++            half4 wq = *(const half4*) (w + (size_t) h * D + 4 * c);
++            float4 us = *(const float4*) (up_s + (size_t) h * D + 4 * c);
++            float coef = rmr_s[h] * inv_h;
++            o.x = fmaf(sigmoidf_(g[h].x * us.x) * coef * LOW_TO_FLOAT(wq.x),  s.x, o.x);
++            o.y = fmaf(sigmoidf_(g[h].y * us.y) * coef * HIGH_TO_FLOAT(wq.x), s.y, o.y);
++            o.z = fmaf(sigmoidf_(g[h].z * us.z) * coef * LOW_TO_FLOAT(wq.y),  s.z, o.z);
++            o.w = fmaf(sigmoidf_(g[h].w * us.w) * coef * HIGH_TO_FLOAT(wq.y), s.w, o.w);
++        }
++        if (HALF_OUT)
++        {
++            half2* out2 = (half2*) ((half*) mixed + (size_t) r * D);
++            out2[c * 2] = __floats2half2_rn(o.x, o.y);
++            out2[c * 2 + 1] = __floats2half2_rn(o.z, o.w);
++        }
++        else
++            ((float4*) ((float*) mixed + (size_t) r * D))[c] = o;
++    }
++}
++
++
+ // Residual update for one sublayer site: x[h, d] <- post[h] * y[d] + sum_h' comb[h', h] *
+ // x[h', d]. Without comb (GatedResidual): x[h, d] <- post[h] * y[d] + x[h, d]. Pure per-column
+ // mix of the H stream rows, so it runs in place: each thread loads all H values of its columns
+@@ -1111,3 +1300,70 @@ void gr_mix
+     #undef ARGS
+     cuda_check(cudaPeekAtLastError());
+ }
++
++void gr_mix_int8
++(
++    const at::Tensor& streams,           // (R, H, D) float
++    const at::Tensor& fn_q,              // (M, H * D) int8
++    const at::Tensor& fn_s,              // (M) float
++    const at::Tensor& up_q,              // (H, D / 4, LR, 4) int8
++    const at::Tensor& up_s,              // (H, D) float
++    const at::Tensor& w,                 // (H * D) half
++    double rms_eps,
++    at::Tensor dots,
++    c10::optional<at::Tensor> post,
++    at::Tensor mixed
++)
++{
++    const at::cuda::OptionalCUDAGuard device_guard(streams.device());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++
++    TORCH_CHECK_DTYPE(streams, kFloat);
++    TORCH_CHECK(fn_q.dtype() == at::kChar && up_q.dtype() == at::kChar, "gr_mix_int8: int8 weights required");
++    TORCH_CHECK_DTYPE(fn_s, kFloat);
++    TORCH_CHECK_DTYPE(up_s, kFloat);
++    TORCH_CHECK_DTYPE(w, kHalf);
++    TORCH_CHECK_DTYPE(dots, kFloat);
++    TORCH_CHECK(streams.is_contiguous() && fn_q.is_contiguous() && up_q.is_contiguous() &&
++                fn_s.is_contiguous() && up_s.is_contiguous() && w.is_contiguous() && dots.is_contiguous(),
++                "gr_mix_int8: contiguous inputs required");
++    int R = streams.size(0);
++    int H = streams.size(1);
++    int D = streams.size(2);
++    int M = fn_q.size(0);
++    TORCH_CHECK(up_q.dim() == 4 && up_q.size(0) == H && up_q.size(1) == D / 4 && up_q.size(3) == 4,
++                "gr_mix_int8: up_q must be the (H, D / 4, LR, 4) layout");
++    int LR = up_q.size(2);
++    TORCH_CHECK(H == 4, "gr_mix_int8: H = 4 only");
++    TORCH_CHECK(D % 8 == 0, "gr_mix_int8: dims");
++    TORCH_CHECK(M == LR + (post ? H : 0), "gr_mix_int8: fn rows must be LR (+ H with post)");
++    TORCH_CHECK(fn_q.size(1) == H * D && w.numel() == H * D, "gr_mix_int8: dims");
++    TORCH_CHECK(fn_s.numel() == M && up_s.numel() == H * D, "gr_mix_int8: scale shapes");
++    TORCH_CHECK(dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix_int8: dots shape");
++
++    dim3 grid_a(M + 1, R);
++    gr_dots_i8_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
++    (
++        (const float*) streams.data_ptr(), (const int8_t*) fn_q.data_ptr(),
++        (const float*) fn_s.data_ptr(), (float*) dots.data_ptr(), M, D
++    );
++    cuda_check(cudaPeekAtLastError());
++
++    const int gran = 4 * (NUM_THREADS / 32);
++    int chunks_c = std::max(1, std::min((D + gran - 1) / gran, 512 / R));
++    int chunk_cols = ((D / chunks_c + gran - 1) / gran) * gran;
++    int n_chunks = (D + chunk_cols - 1) / chunk_cols;
++    dim3 grid_c(n_chunks, R);
++    int smem = LR * sizeof(float);
++    float* post_p = post ? (float*) post.value().data_ptr() : nullptr;
++    #define ARGS_I8 \
++        (const float*) streams.data_ptr(), (const float*) dots.data_ptr(), \
++        (const int8_t*) up_q.data_ptr(), (const float*) up_s.data_ptr(), (const half*) w.data_ptr(), \
++        post_p, mixed.data_ptr(), D, LR, chunk_cols, (float) rms_eps
++    if (mixed.dtype() == at::kHalf)
++        gr_finalize_i8_kernel<4, true><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS_I8);
++    else
++        gr_finalize_i8_kernel<4, false><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS_I8);
++    #undef ARGS_I8
++    cuda_check(cudaPeekAtLastError());
++}
+diff --git a/exllamav3/exllamav3_ext/hc_mix.cuh b/exllamav3/exllamav3_ext/hc_mix.cuh
+index 67a6fc4..03a9e35 100644
+--- a/exllamav3/exllamav3_ext/hc_mix.cuh
++++ b/exllamav3/exllamav3_ext/hc_mix.cuh
+@@ -54,3 +54,17 @@ void gr_mix
+     c10::optional<at::Tensor> post,
+     at::Tensor mixed
+ );
++
++void gr_mix_int8
++(
++    const at::Tensor& streams,
++    const at::Tensor& fn_q,
++    const at::Tensor& fn_s,
++    const at::Tensor& up_q,
++    const at::Tensor& up_s,
++    const at::Tensor& w,
++    double rms_eps,
++    at::Tensor dots,
++    c10::optional<at::Tensor> post,
++    at::Tensor mixed
++);
+diff --git a/exllamav3/modules/hyperconnections.py b/exllamav3/modules/hyperconnections.py
+index dfe28d4..9880c9b 100644
+--- a/exllamav3/modules/hyperconnections.py
++++ b/exllamav3/modules/hyperconnections.py
+@@ -7,6 +7,11 @@ from .rmsnorm import RMSNorm
+ from ..model.config import Config
+ from ..ext import exllamav3_ext as ext
+ from ..util.tensor import g_tensor_cache
++import os as _os
++# EXL3_GR_INT8=1: store the fused decode mixer weights (fn_h, upx_h) as int8 + per-row fp32
++# scales. Halves the ~1.3 GB/round these read on a 96-site model; validated on Qwen3.8-Flash-Next
++# (int8 sim: greedy acceptance 58-63% vs 63% fp16; int4 collapses to 20%, so 8 is the floor)
++_GR_INT8 = _os.environ.get("EXL3_GR_INT8", "0") == "1"
+ 
+ # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
+ # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
+@@ -307,12 +312,34 @@ class GatedResidual(Module):
+         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
+         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
+             .permute(0, 1, 3, 2).contiguous()
++        self.fn_q = self.fn_s = self.upx_q = self.upx_s = None
++        if _GR_INT8:
++            self._quantize_int8(H, Dh)
++
++    def _quantize_int8(self, H: int, Dh: int):
++        """int8 symmetric, per-row scales along the contracted dim.
++        fn_h  (M, H*D): contracted over H*D  -> scale per row j        -> fn_s (M,)
++        upx_h (H, D/4, LR, 4): contracted over LR -> scale per channel (h, d) -> upx_s (H, D)
++        The fp16 fused-path copies are dropped afterwards; fn_h/upx_h become None so any code
++        path that still expects them fails loudly instead of silently reading fp16."""
++        qmax = 127.0
++        f = self.fn_h.float()
++        fs = f.abs().amax(dim = 1).clamp_min(1e-8) / qmax                  # (M,)
++        self.fn_q = torch.round(f / fs[:, None]).clamp_(-128, 127).to(torch.int8).contiguous()
++        self.fn_s = fs.contiguous()
++        u = self.upx_h.float()                                              # (H, D/4, LR, 4)
++        us = u.abs().amax(dim = 2).clamp_min(1e-8) / qmax                   # (H, D/4, 4)
++        self.upx_q = torch.round(u / us[:, :, None, :]).clamp_(-128, 127).to(torch.int8).contiguous()
++        self.upx_s = us.reshape(H, Dh).contiguous()                         # (H, D) channel order d = 4*c + k
++        self.fn_h = None
++        self.upx_h = None
+ 
+     @override
+     def unload(self):
+         super().unload()
+         self.norm_w_raw = self.norm_w = self.w_h = None
+         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = self.fn_h = None
++        self.fn_q = self.fn_s = self.upx_q = self.upx_s = None
+ 
+     @override
+     def get_tensors(self):
+@@ -371,11 +398,15 @@ class GatedResidual(Module):
+                 if cached:
+                     return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
+                 return torch.empty((numel,), dtype = dtype, device = dev)
+-            M = self.fn_h.shape[0] + 1
++            M = (self.fn_q if self.fn_q is not None else self.fn_h).shape[0] + 1
+             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
+             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
+             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
+-            ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
++            if self.fn_q is not None:
++                ext.gr_mix_int8(s3, self.fn_q, self.fn_s, self.upx_q, self.upx_s, self.w_h,
++                                self.rms_eps, dots, post, mixed)
++            else:
++                ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+         else:
+             post = torch.empty((R, H), dtype = torch.float, device = dev) \
+                 if self.use_combine else None
+-- 
+2.50.1 (Apple Git-155)
+
