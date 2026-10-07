@@ -94,6 +94,54 @@ exllamav3 的三个分支已推到本仓的 `exllamav3/*` 命名空间，保留�
 
 ---
 
+## 必须打的补丁：requeue 计数
+
+**路线 A 有一个必须打的本地补丁**，否则长生成的 decode 速率会被少报最多 3 倍：
+
+```bash
+cd ~/qwen38-exl3/exllamav3
+git apply .../exllamav3-patches/0005-rq-token-accounting.patch
+# 或（幂等）
+python3 .../exllamav3-patches/apply_rq_token_fix.py
+```
+
+**缺陷**（`exllamav3/generator/job.py`，`prepare_for_requeue()`）：
+
+```python
+"rq_new_tokens": self.new_tokens,     # self.new_tokens 只是【当前段】
+```
+
+`self.rq_new_tokens` 才是累计值，而最终上报是 `rq_new_tokens + new_tokens`。
+**第 2 次及以后的 requeue 会把累计覆盖成当前段，前面所有段全部丢失。**
+
+触发条件是 requeue 次数：请求生成超过 `max_rq_tokens`（`output_chunking` 默认开时
+= `chunk_size` 4096，按递归检查点对齐）就 requeue 一次。**所以只有长输出才暴露，
+表现为"跑一阵之后速率莫名掉到 1/3"。**
+
+**实测（同负载、同 prompt、同 max_tokens）：**
+
+| | 输出 | T/s | 恒等式 `接受数 ≤ 输出` |
+|---|---:|---:|---|
+| 修复前 | 4,897 | **17.2** | ★ 违反 3,587 |
+| 修复后 | **15,000** | **51.4** | ✓ 成立 |
+
+耗时 299 s vs 308 s 基本一致 —— **引擎从头到尾没慢过**（13,291 轮实测 `verify_ms` 中位
+37.7 ms，全程平稳），**只有计数器少算了**。
+
+完整分析、排查路径与操作教训见
+[`docs/decode-drop-root-cause.md`](docs/decode-drop-root-cause.md)。
+
+**快速自检**（不需要任何埋点）：对每个完成的请求检查
+
+```
+accepted_draft_tokens <= new_tokens
+```
+
+一轮产出 `接受数 + 1` 个 token，所以这个不等式必须成立。**违反即中招。**
+工具：[`exllamav3-tabby/bench/identity_check.py`](exllamav3-tabby/bench/identity_check.py)。
+
+---
+
 ## 快速开始
 
 ### 路线 A（原生 EXL3）

@@ -41,6 +41,29 @@ see it.
 | `total_ms` | the whole round (draft + verify) |
 | `acc` / `rej` | deltas of the job-level draft counters this round |
 
+## The companion line: `[requeue]`
+
+Emitting one line per requeue was what pinned the accounting bug, so it is worth knowing about even
+though it is a separate diagnostic:
+
+```
+[requeue] ser=0 new_tokens=6005 rq_new_tokens=0     accepted=2965 kv=6139
+[requeue] ser=0 new_tokens=4096 rq_new_tokens=6005  accepted=5197 kv=10235
+[requeue] ser=0 new_tokens=4096 rq_new_tokens=10101 accepted=7851 kv=14331
+```
+
+| Field | Meaning |
+|---|---|
+| `new_tokens` | tokens produced in the segment that is ending |
+| `rq_new_tokens` | the running total carried into this segment |
+| `accepted` | accepted draft tokens so far, cumulative |
+| `kv` | sequence position at the requeue |
+
+Reading it: `rq_new_tokens` must grow by the `new_tokens` of the previous line. If it does not, the
+running total is being overwritten rather than accumulated — which is exactly the bug described in
+[decode-drop-root-cause.md](decode-drop-root-cause.md), where the second line read
+`rq_new_tokens=4096` after a `new_tokens=6005` segment.
+
 ## How to read it
 
 - **Rounds multiplying with healthy `verify_ms`** → acceptance collapsed. Check `acc` per round.

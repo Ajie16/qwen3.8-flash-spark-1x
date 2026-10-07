@@ -1,5 +1,20 @@
 # Why decode rate collapses — measured answer
 
+> **Correction (2026-10-07, later the same day).** The engine-side relationship measured here is
+> correct and was confirmed three times: decode rate really is
+> `(acceptance x window + 1) / round_time`, with r >= +0.99 across content types, and it predicts
+> every arm of the A/B within 1-35 %.
+>
+> **But it is not the explanation for the drop the operator reported.** That was an accounting
+> defect which truncated the *reported* output on requeues, making the published rate up to 3x too
+> low while the engine ran at full speed - see
+> [decode-drop-root-cause.md](decode-drop-root-cause.md).
+>
+> The two are complementary rather than competing: this page describes what the engine does, that
+> page describes what the counter reported. Read this one for "how fast can this engine go, and
+> why"; read that one for "why did the number on screen fall". Taken alone, this page sends you
+> optimising acceptance when the number you were watching was never measuring acceptance's effect.
+
 **Conclusion: decode tok/s is `(accepted per round + 1) / round_time`. The round time is set by the
 target verify forward and is nearly independent of how many draft tokens were attempted, so
 throughput is driven almost entirely by draft acceptance, which is content-dependent.**

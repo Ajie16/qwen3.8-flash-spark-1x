@@ -1,5 +1,8 @@
 # Decode-rate drop: root cause found and fixed
 
+> **Confirmed in production use, 2026-10-07.** After restarting on the fixed engine the operator
+> reports the drop no longer occurs on real agent traffic.
+
 **Root cause: one line in `exllamav3/generator/job.py`. `rq_new_tokens` was assigned the current
 segment's token count instead of the running total, so on the second and later requeues every
 earlier segment was dropped from the reported output. The engine never slowed down — the published
