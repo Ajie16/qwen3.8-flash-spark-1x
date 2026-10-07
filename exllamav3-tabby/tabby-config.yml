@@ -31,7 +31,7 @@ model:
   max_seq_len: ${MAX_SEQ_LEN}
   cache_size: ${CACHE_SIZE}
   cache_mode: "8,8"
-  chunk_size: 4096
+  chunk_size: ${CHUNK_SIZE}
 
   # Concurrent generation jobs. Each one also reserves a recurrent-state slot for the 36
   # linear-attention layers. TabbyAPI's own default for recurrent models is 4.

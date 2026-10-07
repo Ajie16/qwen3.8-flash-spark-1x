@@ -56,6 +56,18 @@ export EXL3_GR_INT8="${EXL3_GR_INT8:-1}"              # int8 hyperconnection mix
 # so 163840 is the choice. Above 163840 the marginal return is ~0.01 coverage/MB; stop there.
 export EXL3_MTP_HEAD_N="${EXL3_MTP_HEAD_N:-163840}"
 export EXL3_DRAFT_CONFIDENCE="${EXL3_DRAFT_CONFIDENCE:-0.6}"  # dynamic-draft target (+8 prose vs 0.4)
+
+# Prefill chunk = the M dimension of every prefill GEMM. TabbyAPI passes it through as
+# max_chunk_size and the engine treats anything beyond it as having no effect, so this is the
+# one structural prefill lever that needs no rebuild.
+#
+# It is also max_rq_tokens (the output-requeue threshold, backends/exllamav3/model.py), so
+# raising it halves the requeue count as well - fewer re-prefills.
+#
+# Measured at a 40k prompt: 4096 -> 1,004 tok/s, 8192 -> 1,145 tok/s (+14%), decode unchanged
+# (52.0 -> 51.9 mean), resident set +2 GiB. 16384 is refused by the autosplit headroom check on
+# this box with NGRAM_RAM=true, so 8192 is the ceiling here unless memory is freed first.
+export CHUNK_SIZE="${CHUNK_SIZE:-8192}"
 # Fused cooperative GR mix kernel (dots + finalize in one launch, grid.sync, L2 prefetch). Needs
 # EXL3_SPEC_SRC above, or it is a no-op. Gated internally to R <= 4 and D % 16 == 0; nsys shows the
 # GR pair runs at R = 1..6 with R <= 4 covering ~86% of calls, and R >= 5 deliberately keeps the
@@ -138,21 +150,37 @@ pin_cmd() {
 #   KV:      ~13 KB/token at 8-bit (12 full-attention layers + MTP layer, 2 KV heads x 256)
 #   slack:   8 GiB for activations, recurrent slots, CUDA context, and the OS
 check_memory() {
-  local cache="$1" ngram_ram="$2"
-  python3 - "$MODEL_DIR" "$cache" "$ngram_ram" <<'PY' || true
-import glob, os, sys
-d, cache, ram = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "true"
+  local cache="$1" ngram_ram="$2" chunk="$3"
+  python3 - "$MODEL_DIR" "$cache" "$ngram_ram" "$chunk" <<'PY' || true
+import glob, json, os, sys
+d, cache, ram, chunk = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "true", int(sys.argv[4])
 G = 1024**3
 files = [os.path.realpath(p) for p in glob.glob(os.path.join(d, "*.safetensors"))]
 ngram = sum(os.path.getsize(p) for p in files if "ngram" in os.path.basename(p))
 rest = sum(os.path.getsize(p) for p in files if "ngram" not in os.path.basename(p))
-need = rest + (ngram if ram else 0) + cache * 13 * 1024 + 8 * G
+
+# Prefill workspace - the term this estimate used to omit, which made it blind to CHUNK_SIZE.
+# The logits buffer dominates: chunk x vocab at fp16. Measured on this pack, 4096 -> 8192 grew the
+# resident set ~2 GiB, and 4096 x 248320 x 2 B = 1.89 GiB, which matches. It is a peak transient
+# rather than steady state, so charging it in full is deliberately conservative for a pre-flight
+# check. Still a lower bound: attention and MoE scratch are not modelled, which is why 16384 was
+# refused even though this arithmetic says it fits.
+vocab = 248320
+try:
+    cfg = json.load(open(os.path.join(d, "config.json")))
+    vocab = (cfg.get("text_config") or cfg).get("vocab_size") or vocab
+except Exception:
+    pass
+chunk_ws = chunk * vocab * 2
+
+need = rest + (ngram if ram else 0) + cache * 13 * 1024 + chunk_ws + 8 * G
 avail = next(int(l.split()[1]) * 1024 for l in open("/proc/meminfo") if l.startswith("MemAvailable"))
 msg = (f"memory estimate: {need/G:.0f} GiB needed (weights {rest/G:.0f}"
-       f"{f' + n-gram {ngram/G:.0f}' if ram else ''} + KV {cache*13*1024/G:.0f} + 8 slack), "
-       f"{avail/G:.0f} GiB available")
+       f"{f' + n-gram {ngram/G:.0f}' if ram else ''} + KV {cache*13*1024/G:.0f}"
+       f" + chunk {chunk_ws/G:.1f} (at CHUNK_SIZE {chunk}) + 8 slack), {avail/G:.0f} GiB available")
 print(("warning: " if need > avail else "==> ") + msg, file=sys.stderr)
 if need > avail:
-    print("         lower CACHE_SIZE, use NGRAM_RAM=false, or PROFILE=single", file=sys.stderr)
+    print("         lower CACHE_SIZE or CHUNK_SIZE, use NGRAM_RAM=false, or PROFILE=single",
+          file=sys.stderr)
 PY
 }

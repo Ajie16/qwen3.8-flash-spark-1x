@@ -61,7 +61,7 @@ mkdir -p "$MODEL_PARENT"
 find "$MODEL_PARENT" -mindepth 1 -maxdepth 1 -type l -delete
 ln -sfn "$MODEL_DIR" "$MODEL_PARENT/$MODEL_NAME"
 export STATE_DIR HOST PORT DISABLE_AUTH MODEL_PARENT MODEL_NAME MAX_SEQ_LEN CACHE_SIZE MAX_BATCH_SIZE \
-       NGRAM_RAM VISION DRAFT_NUM_TOKENS
+       NGRAM_RAM VISION DRAFT_NUM_TOKENS CHUNK_SIZE
 
 CONFIG="$STATE_DIR/config.yml"
 RENDER_PY="$VENV/bin/python"; [[ -x "$RENDER_PY" ]] || RENDER_PY="$PYTHON_BIN"
@@ -84,7 +84,7 @@ verify_runtime
 [[ -f "$TABBY_DIR/main.py" ]] || die "no TabbyAPI at $TABBY_DIR. Run: bash exllamav3-tabby/setup.sh"
 verify_pack
 drop_pack_cache
-check_memory "$CACHE_SIZE" "$NGRAM_RAM"
+check_memory "$CACHE_SIZE" "$NGRAM_RAM" "$CHUNK_SIZE"
 export PATH="$CUDA_HOME/bin:$VENV/bin:$PATH"
 say "TabbyAPI $(git -C "$TABBY_DIR" rev-parse --short HEAD) on http://$HOST:$PORT/v1, model id: $MODEL_NAME"
 # TabbyAPI resolves templates/, sampler_overrides/ and api_tokens.yml relative to its cwd.
