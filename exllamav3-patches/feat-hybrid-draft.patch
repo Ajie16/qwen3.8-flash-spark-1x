@@ -1,0 +1,3706 @@
+diff --git a/docs/hybrid_draft.md b/docs/hybrid_draft.md
+new file mode 100644
+index 0000000..68f46dc
+--- /dev/null
++++ b/docs/hybrid_draft.md
+@@ -0,0 +1,99 @@
++# M3: Hybrid ngram + MTP drafting
++
++`EXL3_HYBRID_NGRAM=1` (default off = master behavior). Every round, each job drafts
++from its suffix-automaton continuation when the automaton finds a repeat of at least
++`EXL3_NGRAM_MIN_MATCH` tokens (default 8) with continuation left to copy — near-free on
++repetitive content (code, markup, templates) where repeats accept in long runs — and
++falls back to the MTP draft otherwise. Both sources share the legacy match-verify in
++`iterate_gen`, so outputs keep baseline (non-spec) sampling semantics.
++
++The pre-existing pure-ngram mode (`ngram_match_min`, mutually exclusive with a draft
++model) is untouched.
++
++## Knobs
++
++| env | default | meaning |
++|---|---|---|
++| `EXL3_HYBRID_NGRAM` | 0 | master switch; requires the MTP drafter |
++| `EXL3_NGRAM_MIN_MATCH` | 8 | minimum suffix-repeat length to engage ngram |
++| `EXL3_NGRAM_MAX_DRAFT` | 7 | max continuation tokens per ngram round. Do not raise past 7: the target forward switches kernels at q_len > 8 and decode collapses (measured on GB10: w=7 107 tok/s, w=8 46 tok/s on exact-repeat content) |
++| `EXL3_HYBRID_STATS` | 0 | `hybrid-stats r=.. ng=.. na=.. ma=..` every 50 rounds: ngram round share, per-position ngram acceptance, per-position MTP acceptance |
++| `EXL3_NGRAM_ADAPTIVE` | 1 | per-job backoff: disengage ngram below `EXL3_NGRAM_MIN_ACC` acceptance, re-probe later |
++| `EXL3_NGRAM_MIN_ACC` | 0.25 | per-position ngram acceptance floor (0.25 × 16-wide window ≈ the MTP round's yield) |
++| `EXL3_NGRAM_ADAPT_ROUNDS` | 16 | ngram rounds between engagement evaluations |
++| `EXL3_NGRAM_PROBE_ROUNDS` | 64 | rounds a disengaged job waits before re-probing |
++
++## Round structure (`Generator.iterate_hybrid_gen`)
++
++1. Probe every prefill-done job's SAM (`Job.probe_ngram_draft`). `accept_tensor`
++   consumes history incrementally and rebuilds on rewind, so intermittent probing
++   (ngram this round, MTP the next) is exact; a non-qualifying probe still does the
++   bookkeeping that keeps the automaton current.
++2. No candidates: pure MTP round, identical to the un-hybrid path.
++3. All candidates: pure ngram round — the MTP draft forward is skipped entirely.
++4. Mixed: the regular full-batch MTP draft runs (sub-batching the drafter would save
++   ~4 ms against a ~34 ms target-forward floor but desync the calibrator and shadow
++   row maps), then ngram rows overwrite their MTP rows. Rows are padded to the round's
++   combined window with token 0; a pad position verifies like any draft position —
++   accepts iff the target samples the pad token (exact, just unlikely), rejects the
++   remainder otherwise.
++
++## MTP state alignment (why ngram rounds are safe mid-stream)
++
++The MTP carry (`job.mtp_last_hidden`) and the draft KV are maintained by `iterate_gen`
++from the **target** forward, not by the drafter: `draft_verifier_params` are added to
++the target forward whenever a draft model is attached (regardless of draft source), the
++post-verify `draft_model.prefill` writes the accepted tokens — whoever proposed them —
++into the draft cache, and `mtp_last_hidden` is re-paired with the last accepted
++position. An ngram round therefore advances MTP state exactly like an MTP round, and
++MTP drafting resumes on any later round from a consistent carry. The drafter's
++speculative KV positions are position-indexed scratch rewritten every round, so a
++skipped draft forward leaves nothing stale.
++
++## Interactions
++
++- **Spec sampling (M2)**: suppressed whenever hybrid is on (one warning at init). An
++  ngram round has no draft q, and mixing per-row verify semantics mid-round leaves
++  neither the M2-exact nor the legacy distribution. Shadow observation
++  (`EXL3_SPEC_SHADOW`) still works on pure-MTP rounds; rounds with any ngram row are
++  skipped because the shadow's logq rows describe discarded MTP drafts.
++- **Confidence calibrator**: pure ngram rounds produce no labels. In mixed rounds,
++  ngram rows are skipped (their MTP conf/ids pairs were never tested) and MTP rows
++  clamp acceptance to the real draft width (pad accepts have no conf entry).
++- **Page budget**: `draft_reserve_tokens` is bumped to `EXL3_NGRAM_MAX_DRAFT` so a wide
++  ngram window never outruns the job's allocated pages.
++- **Recurrent state history**: GDN conv/state buffers are sized by the frontend from
++  the draft window (tabbyAPI: `max_history = draft_num_tokens`). A wider ngram window
++  overflows them — the generator clamps `EXL3_NGRAM_MAX_DRAFT` to `cache.max_history`
++  as a safety net, and the frontend should size `max_history` for the wider window
++  (the local tabbyAPI patch does, env-gated on `EXL3_HYBRID_NGRAM`).
++
++## Failure mode: structural repeats with varying content
++
++A long suffix repeat does not imply a repeating continuation — JSON record lists share
++long key prefixes but diverge at the values. The first live run accepted only ~8% per
++position on such content (and a wide window costs more than an MTP window once the
++continuation diverges), hence the per-job adaptive backoff: below
++`EXL3_NGRAM_MIN_ACC` per-position acceptance the job returns to MTP drafting and
++re-probes every `EXL3_NGRAM_PROBE_ROUNDS` rounds. Exact repetition (boilerplate,
++tables, templates) accepts 40%+ per position and stays engaged.
++
++## Measured (GB10 single Spark, w=7 + adaptive, 2026-09-28)
++
++Same-session A/B against the MTP-only baseline (identical serve config otherwise):
++
++| load | baseline | hybrid | note |
++|---|---|---|---|
++| T1 code+think | 51.4 tok/s | 51.9 tok/s | par (ngram rarely qualifies) |
++| T2 prose | 41.7 | 41.0 | par, no regression |
++| T5c decode @74k ctx | 44.3 | 42.5 | par within this box's thermal drift |
++| needle 3/3 | 3/3 | 3/3 | quality unchanged |
++| exact-repeat boilerplate | 83.7 | **112.4** | **+34%**, na ≈ 1.0 |
++| JSON record list | 86.0 | 77.5 | adaptive bounds the misfire (was 37 without it) |
++
++The standard bench's code/prose content rarely produces ≥8-token suffix repeats, so
++hybrid is near-invisible there by design; the win case is exact-repetition
++boilerplate. Window sweep on exact-repeat content: w=5 98 tok/s, w=7 107-112 tok/s,
++w=8 46 tok/s (kernel cliff — see the knob table).
++
++CPU gates: `tests/test_hybrid_draft_cpu.py` (standalone, no pytest).
+diff --git a/docs/spec_sampling.md b/docs/spec_sampling.md
+new file mode 100644
+index 0000000..25f941f
+--- /dev/null
++++ b/docs/spec_sampling.md
+@@ -0,0 +1,192 @@
++# Exact Speculative Sampling for MTP Drafts — Design
++
++Status: design (M0). Target: upstream PR to vcruz305/exllamav3.
++
++## 1. Motivation and current state
++
++Current drafting for Qwen3.8-Flash-Next (Qwen4Exp MTP):
++
++- **Draft** (`architecture/qwen4_exp_mtp.py:169` `sample_from_state`): greedy argmax over
++  the pruned head (`EXL3_MTP_HEAD_N=110592`, GEMM output `y` is the full draft logit row).
++- **Verify** (`generator/generator.py` serial loop, ~L1185): sample target at each window
++  position with the job's full sampler; accept draft iff `sampled == draft`; on mismatch emit
++  the sampled token and cut the window. The batch-verify fast path only engages for pure
++  greedy stacks (`CustomSampler.supports_batch_verify`), so any temp/top_p/top_k/penalty
++  preset takes the serial path.
++
++Match-verify is **distribution-exact** — the emitted token's marginal is exactly p at every
++position: P(emit d) = P(sample == d) = p(d); P(emit y≠d) = P(sample == y) = p(y). The
++problem is purely efficiency: acceptance = E_p[p(d_greedy)], which collapses when p is flat.
++
++Measured on the live server (Qwen3.8-Flash-Next, abliterated 3bpw, forced preset
++temp 0.6 / top_p 0.95 / top_k 20 / rep_penalty 1.05, 5 draft tokens, ngram RAM on):
++
++| workload | match acceptance | decode |
++|---|---|---|
++| code + thinking | ~70% | ~50-60 tok/s |
++| CJK prose | ~45% | ~45 tok/s |
++
++Exact speculative sampling (Leviathan et al. 2023) raises per-position acceptance to the
++total-variation overlap E[Σ_x min(p(x), q(x))] — strictly ≥ the match rate — while keeping
++the output distribution exactly p. Expected on this setup: prose 45% → 65-80% acceptance,
++decode 45 → 60-70 tok/s. This is the largest remaining single-node lever.
++
++## 2. Algorithm
++
++Per verification window (n = num_draft_tokens):
++
++1. **Draft**: for i in 1..n, draw d_i ~ q_i instead of argmax. q_i is the draft head's
++   distribution with an optional temperature knob (`EXL3_SPEC_Q_TEMP`, default 0.6 to match
++   the deployment's forced target temperature; overlap is maximized when q ≈ p in shape).
++   Store per position: d_i, q_i(d_i), and the q_i row log-probs (pruned head slice,
++   110592 × fp16 ≈ 216 KB/position; full window × C4 batch ≈ 4.4 MB on device — fine).
++2. **Verify** (serial per position, same loop skeleton as today):
++   - p_i = the job sampler's post-transform distribution over the full vocab at position i
++     (temp/top_k/top_p/rep-penalty — supported subset, see §4). Past-ids–dependent steps use
++     the accepted prefix so far, exactly as the serial loop already advances them.
++   - Draw u ~ U[0,1) from job.rng. Accept d_i iff u < min(1, p_i(d_i)/q_i(d_i)).
++   - On reject: emit t ~ renorm((p_i − q_i)⁺) and cut the window. q outside the pruned
++     head slice is 0 by construction (such tokens are never drafted), so the residual there
++     equals p — correct without materializing q beyond the slice.
++   - On full window accept: bonus token from p at the last logit row, as today.
++3. **Exactness**: standard speculative-sampling proof; the output distribution is exactly
++   the job sampler's p, independent of q. q quality affects only speed.
++
++## 3. Shadow mode (M1 — de-risk before touching the active path)
++
++`EXL3_SPEC_SHADOW=1`: legacy match-verify executes unchanged; additionally, at each verify
++position, compute and log Σ_x min(p_i(x), q_i^T(x)) for T ∈ {0.6, 0.8, 1.0} (q temperature
++rescaling from the stored logit row; 3 extra softmaxes over 110k — negligible). Report
++expected acceptance per workload from real traffic.
++
++This produces the go/no-go number for M2 on real data in ~1 day, with zero behavior change.
++
++## 4. Scope and fallbacks (legacy match-verify retained)
++
++Opt-in: `EXL3_SPEC_SAMPLING=1` (default off until M3 validation lands).
++
++Spec path engages only when ALL hold, else legacy path per window:
++
++- drafter is MTP with pruned-head probs available (draft payload carries q rows)
++- job sampler stack ∈ supported subset: temp, top_k, top_p, rep_penalty (+ no-op
++  normalizations), multinomial draw. Anything else (DRY, min_p, XT C, banned tokens,
++  logit bias, filters, forced ids, return_probs/top_tokens, CFG/multi-sequence,
++  device logit mask) → legacy
++- ngram draft rounds (no q) → legacy, as today
++
++A `CustomSampler.supports_spec_sampling` flag (analogous to `supports_batch_verify`) is
++computed at construction from the executed stack.
++
++## 5. Code changes (~350-450 lines)
++
++| file | change |
++|---|---|
++| `architecture/qwen4_exp_mtp.py` | new probs-export mode next to `sample_from_state`: reuse the pruned-head GEMM `y`, per-job temperature scale, fp32 log_softmax, multinomial sample from job-visible seed, return (ids, q(d), logq rows). `sample_from_state` untouched — legacy path unaffected. Other `*_mtp.py` archs can adopt later. |
++| `generator/generator.py` | draft loop (`iterate_draftmodel_mtp_gen`, ~L715): carry per-job payload {ids, q_d, logq_rows} alongside `draft_ids_pinned`, incl. the device-resident (`EXL3_MTP_DEVICE_DRAFT`) chain. Verify loop (~L1185): spec branch before legacy; per-position p transform, accept test, (p−q)⁺ resample, rejection bookkeeping reusing `reject_remainder`. Shadow-mode hooks behind env flag. |
++| `generator/sampler/custom.py` | `supports_spec_sampling` flag + `transformed_logprobs(logits_row, past_ids) -> (logp, sample_fn)` for the supported subset, reusing existing step math (no duplicated transform logic). |
++| `generator/spec_sampling.py` (new) | pure, unit-testable core: accept test, residual (p−q)⁺ renorm + draw, RNG plumbing. No generator state. |
++| `tests/` (CPU, follows dec24f8 pattern) | synthetic p/q distribution test: N windows, chi-square of emitted tokens vs p; acceptance ≈ Σ min(p,q) within tolerance; residual-draw correctness when p⊥q. |
++
++RNG: all draws from job.rng in a fixed serial order (draft sample → per-position accept u →
++residual draw), keeping runs reproducible per seed.
++
++## 6. Validation (M3)
++
++- **Distribution**: seed-fixed long generations spec on vs off — unigram KL within noise,
++  teacher-forced mean logprob parity; the CPU chi-square test as the hard gate.
++- **Quality**: needle suite 3/3 at 75k; long-output tail inspection (the 3bpw乱码 regression
++  class) under the forced preset.
++- **Speed** (`exl3bench.py` standard suite, hot state): targets prose ≥ 55 (from ~45),
++  code ≥ 65 (from ~50-60), T5c long-ctx decode up proportionally; step overhead ≤ 1.5 ms
++  (6 × full-vocab softmax + rare residual draws).
++
++## 7. Dev infra and PR logistics
++
++- Worktree `~/qwen38-exl3/exllamav3-spec` on branch `feat/spec-sampling` (from master
++  74b6f5a); live service keeps running the master checkout untouched.
++- A/B: second TabbyAPI on :8898 with PYTHONPATH pointed at the worktree; same model dir.
++- origin is vcruz305/exllamav3 (no push access): at M3 either fork under the user's GitHub
++  and open the PR from there, or send the patch series on an issue. Open a short tracking
++  issue with this design + shadow-mode numbers before the PR.
++
++## 8. Review round 1 (self-audit, d26bb26+)
++
++Findings from re-reviewing against the sampler/draft code; all folded into the plan.
++
++1. **Executed sampler stack is fused, not discrete steps.** Our forced preset collapses to
++   `[SS_RepP, SS_Fused(MODE_SAMPLE_FILTERS, temp, top_k, top_p)]` (`_match_fused_tail`,
++   custom.py:279). The fused kernel emits only the sampled token, no probs — the original
++   "reuse the step math" approach does not apply. Instead: implement a standalone
++   `spec_transform(logits_row, past_ids) -> logp` in `spec_sampling.py` mirroring the fused
++   order semantics exactly (rep_penalty head -> temp -> top_k -> top_p), used ONLY by the
++   spec verify path; the fused fast path stays untouched. Parity test: same logits through
++   (a) fusion-disabled step stack vs (b) spec_transform must match bit-near. v1 supported
++   subset: temp/top_k/top_p + rep_penalty head. min_p and other SS_Fused modes -> legacy
++   fallback.
++2. **MTP state carry is the top integration risk (was missing).** After the window,
++   `job.mtp_last_hidden` must correspond to the last ACCEPTED position; the existing
++   carry/rewind machinery (`checkpoint_rewound`, `rewound_jobs` suppression, post-batch
++   draft carry update) must be reused by the spec path verbatim. Explicit M2 task + a
++   regression test that drafting continues from the correct state after mid-window rejects.
++3. **Confidence calibrator interaction.** Under sampled drafts, export conf = q(d_i)
++   instead of raw max logit. The calibrator re-calibrates online, but dynamic window
++   truncation thresholds will shift; re-sweep the DRAFT_CONFIDENCE sweet spot after M2.
++4. **q shaping (new, zero-cost acceptance upside).** Spec sampling is exact for ANY q, so
++   shape q toward p: apply the draft's own temp/top_k/top_p truncation to q before sampling
++   (its own statistics, no peek at p). Shadow mode evaluates raw / temp-scaled /
++   temp+truncated q variants and picks the default.
++5. **Shadow mode estimates are unbiased over the full window.** Target forward produces all
++   window logit rows regardless of where legacy match-verify cuts; shadow computes expected
++   acceptance for every position, not just up to the legacy cut.
++
++Engineering detail: all acceptance comparisons in log space
++(`log u < min(0, logp - logq)`) to avoid overflow for tiny q(d).
++
++## 9. Review round 2 (M2 live debugging, 2026-09-28)
++
++First live run of M2 failed the rollout gates (acceptance 24-25%, decode -30% vs
++baseline). Instrumented debugging on spark-2 found the spec math and integration
++CORRECT and the loss entirely in window economics and metric interpretation:
++
++1. **The "acceptance half of theory" symptom was a metric mismatch, not a bug.**
++   The shadow's `m` and the API's `draft X/Y accepted` count accepted drafts over
++   DRAFTED positions (E[k]/w). Per-position acceptance a decays geometrically over the
++   window: m = a(1-a^w)/(w(1-a)). At the measured a ~ 0.65 with the forced full window
++   w=5, m = 0.33 — exactly what was observed. Per-position debug counters (d, p(d),
++   q(d), accept bit, one readback per window) showed acc = 0.700/0.645/0.623 vs
++   same-tensor theory ovl = 0.692/0.640/0.612: the accept test matches theory to
++   within noise, drafts really come from shaped q (E[q(d)] ~ 0.9 = q's collision
++   mass), and every round engages (no silent legacy fallback).
++2. **The decode loss was the full-window policy.** The M2 design bypassed the draft
++   calibrator, so every spec round drafted ALL `draft_num_tokens` (5) and verified 6
++   rows. Round cost on this box is dominated by a ~34 ms target-forward floor that is
++   nearly row-count-insensitive at small widths; baseline pays it over ~1.4
++   tokens/round, so spec must amortize it over MORE tokens, but E[k] = a(1-a^w)/(1-a)
++   saturates (a=0.65: w=3 -> 1.35, w=inf -> 1.86) while each extra position costs a
++   serial draft step (~1.3 ms) plus a forward row (~4 ms). Live sweep (quick bench):
++   w=5: 35/27, w=3: ~41/35, w=2: 49/40, w=1: ~45/43 vs baseline 50.9/42.1. Spec
++   rounds now cap the window at EXL3_SPEC_WINDOW (default 1).
++3. **Verify was restructured batched-optimistic.** Position i is only tested when
++   drafts 0..i-1 were accepted, so computing every position's p_i with past =
++   window-start past + d_0..d_{i-1} is EXACT for every tested position. The window
++   costs one transform launch batch plus one scalar readback instead of ~3 GPU->CPU
++   syncs per position (verify phase: 37 ms -> 4.3 ms per round; the rep penalty reads
++   only the last sustain+decay+1 past tokens, so only that tail is captured — sliced
++   indexing provably preserves the distance math, gated by a CPU test).
++4. **Shadow is now tested-basis.** It previously evaluated all window positions with
++   a past that included FUTURE resolved tokens, biasing the q estimates low (0.43-0.51
++   vs true 0.61-0.69) and making m and q incomparable. It now uses the window-start
++   prefix + accepted continuation — exactly the verifier's conditioning — and counts
++   only tested positions, so healthy spec must show m ~= q. Live: m=0.531 vs q=0.51,
++   m=0.466 vs q=0.49. The four-variant ranking still picks temp 0.6 + top_k 20 +
++   top_p 0.95; no acceptance upside left in q retuning (the draft head's intrinsic
++   overlap with p, ~0.5-0.65 by content, is the ceiling).
++5. **Acceptance is content-dependent, so engagement is per-job adaptive (§8.6).**
++   Single-stream spec only pays when a clears the break-even vs legacy drafting
++   (measured: prose a ~ 0.65 wins, code+thinking a ~ 0.5 loses ~15%). Jobs evaluate
++   their rolling E[accepted]/round every EXL3_SPEC_ADAPT_ROUNDS (16) spec rounds;
++   below EXL3_SPEC_MIN_ACC (0.55) the job returns to legacy argmax drafting and
++   re-probes after EXL3_SPEC_PROBE_ROUNDS (128) rounds. This keeps prose on spec
++   while code/thinking jobs converge back to baseline behavior automatically.
++6. Residual diagnostics (EXL3_SPEC_DEBUG accept-test counters, EXL3_SPEC_TIMING phase
++   timers) stay in the tree, default off.
+diff --git a/exllamav3/architecture/qwen4_exp_mtp.py b/exllamav3/architecture/qwen4_exp_mtp.py
+index 40c0c95..4a23647 100644
+--- a/exllamav3/architecture/qwen4_exp_mtp.py
++++ b/exllamav3/architecture/qwen4_exp_mtp.py
+@@ -197,6 +197,10 @@ class Qwen4ExpMTPModel(Model):
+                 xh = torch.empty_like(x)
+                 y = torch.empty((b * q, n2), dtype = torch.half, device = x.device)
+                 ext.exl3_gemm(x, tr, y, inner.suh, xh, svh, -1, inner.mcg, inner.mul1, 0)
++                if params.get("export_draft_logq"):
++                    # Spec-sampling shadow/spec payload: fp32 log-probs over the pruned
++                    # head slice. Passthrough export only; the argmax draft is unchanged
++                    params["draft_logq"] = torch.log_softmax(y.float(), dim = -1).view(b, q, n2)
+                 if params.get("export_draft_conf"):
+                     # -dds: conf is the raw max logit, identical to the full head's when the
+                     # argmax is in-slice; lower otherwise, so drafting stops earlier
+@@ -205,6 +209,10 @@ class Qwen4ExpMTPModel(Model):
+                     return ids.view(b, q)
+                 return torch.argmax(y, dim = -1).view(b, q)
+         logits = lm.forward(state, params)
++        if params.get("export_draft_logq"):
++            params["draft_logq"] = torch.log_softmax(
++                logits[..., :self.attached_model().config.vocab_size].float(), dim = -1
++            )
+         if params.get("export_draft_conf"):
+             logits = logits[..., :self.attached_model().config.vocab_size]
+             conf, ids = torch.max(logits, dim = -1)
+diff --git a/exllamav3/exllamav3_ext/hc_mix.cu b/exllamav3/exllamav3_ext/hc_mix.cu
+index 37bf27f..b28736d 100644
+--- a/exllamav3/exllamav3_ext/hc_mix.cu
++++ b/exllamav3/exllamav3_ext/hc_mix.cu
+@@ -6,6 +6,8 @@
+ #include "util.cuh"
+ #include "graph.cuh"
+ #include <cstdlib>
++#include <cooperative_groups.h>
++namespace cg = cooperative_groups;
+ 
+ /*
+ 
+@@ -1576,6 +1578,270 @@ void gr_mix
+     cuda_check(cudaPeekAtLastError());
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// Fused dots+finalize, gated by EXL3_GR_TUNED=1. One cooperative launch:
++// warp-per-(r, j, h) dots, L2 prefetch of the up_q columns between phases,
++// grid.sync(), per-block t_s/rmr, warp-per-(r, c-quad) finalize. Reassociated
++// vs the stock two-kernel path (fixed deterministic order, no atomics), so
++// results differ from stock within float tolerance but are run-to-run stable.
++//
++// Gated to R <= GR_FUSED_MAX_R: beyond that the stock pair wins because the
++// fused mapping re-reads the int8 tables per row through L2 (cold-cache
++// microbench on GB10, us/site -- stock: R1 39.9, R2 40.8, R3 43.9, R4 55.3,
++// R5 60.4, R6 65.4; fused: R1 34.0, R2 37.5, R3 43.1, R4 50.8, R5 59.1,
++// R6 77.1).
++// ---------------------------------------------------------------------------
++
++#define GR_FUSED_THREADS 256
++#define GR_FUSED_WARPS (GR_FUSED_THREADS / 32)
++#define GR_FUSED_MAX_R 4
++
++template <int H, bool HALF_OUT>
++__global__ __launch_bounds__(GR_FUSED_THREADS, 4)
++void gr_mix_fused_i8_kernel
++(
++    const float* __restrict__ streams,
++    const int8_t* __restrict__ fn_q,
++    const float* __restrict__ fn_s,
++    const int8_t* __restrict__ up_q,
++    const float* __restrict__ up_s,
++    const half* __restrict__ w,
++    float* __restrict__ dots,
++    float* __restrict__ post,
++    void* __restrict__ mixed,
++    const int R,
++    const int M,
++    const int D,
++    const int LR,
++    const float rms_eps
++)
++{
++    const int D4 = D / 4;
++    const int lane = threadIdx.x % 32;
++    const int gwarp = blockIdx.x * GR_FUSED_WARPS + threadIdx.x / 32;
++    const int nwarps = gridDim.x * GR_FUSED_WARPS;
++
++    extern __shared__ float fsmem[];
++    float* t_s = fsmem;              // R * LR
++    float* rmr_s = fsmem + R * LR;   // R * H
++
++    // Phase A: dots, item p = (r * (M + 1) + j) * H + h (flat dots index)
++    const int npairs1 = (M + 1) * H;
++    const int npairs = R * npairs1;
++    const int D8 = D / 8;
++    for (int p = gwarp; p < npairs; p += nwarps)
++    {
++        const int r = p / npairs1;
++        const int jl = p - r * npairs1;
++        const int j = jl / H;
++        const int h = jl % H;
++        const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
++        const float sj = (j < M) ? __ldg(fn_s + j) : 1.0f;
++        float a = 0.0f;
++        if (j < M)
++        {
++            const int2* f8 = (const int2*) (fn_q + ((size_t) j * H + h) * D);
++            const float4* sh = s4 + (size_t) h * D4;
++            for (int c = lane; c < D8; c += 32)
++            {
++                int2 pk = __ldcs(f8 + c);
++                float4 s0 = __ldg(sh + 2 * c);
++                float4 s1 = __ldg(sh + 2 * c + 1);
++                const int8_t* q = (const int8_t*) &pk;
++                a = fmaf(s0.x, (float) q[0], a);
++                a = fmaf(s0.y, (float) q[1], a);
++                a = fmaf(s0.z, (float) q[2], a);
++                a = fmaf(s0.w, (float) q[3], a);
++                a = fmaf(s1.x, (float) q[4], a);
++                a = fmaf(s1.y, (float) q[5], a);
++                a = fmaf(s1.z, (float) q[6], a);
++                a = fmaf(s1.w, (float) q[7], a);
++            }
++        }
++        else
++        {
++            for (int c = lane; c < D4; c += 32)
++            {
++                float4 s = __ldg(s4 + (size_t) h * D4 + c);
++                a = fmaf(s.x, s.x, fmaf(s.y, s.y, fmaf(s.z, s.z, fmaf(s.w, s.w, a))));
++            }
++        }
++        #pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1)
++            a += __shfl_down_sync(0xffffffffu, a, offset);
++        if (lane == 0) dots[p] = a * sj;
++    }
++
++    // L2 prefetch of this warp's phase-B up_q columns (shared across rows;
++    // 3.3 MB at the Qwen3.8 shape fits L2, so phase B reads hit L2)
++    for (int c = gwarp; c < D4; c += nwarps)
++    {
++        #pragma unroll
++        for (int hh = 0; hh < H; ++hh)
++        {
++            const char* base = (const char*) (up_q + (((size_t) hh * D4 + c) * LR) * 4);
++            for (int off = lane * 128; off < LR * 4; off += 32 * 128)
++                asm volatile("prefetch.global.L2 [%0];" :: "l"(base + off));
++        }
++    }
++
++    cg::this_grid().sync();
++
++    // t_s / rmr / post, redundantly per block (dots reads are L2-hot)
++    const int nrows = M + 1;
++    if (threadIdx.x < (unsigned) (R * H))
++    {
++        const int r = threadIdx.x / H;
++        const int hh = threadIdx.x % H;
++        rmr_s[threadIdx.x] = rsqrtf(dots[((size_t) r * nrows + M) * H + hh] / (float) D + rms_eps);
++    }
++    __syncthreads();
++    const float inv_h = 1.0f / (float) H;
++    for (int idx = threadIdx.x; idx < R * LR; idx += GR_FUSED_THREADS)
++    {
++        const int r = idx / LR;
++        const int i = idx - r * LR;
++        const float* dr = dots + (size_t) r * nrows * H;
++        float v = 0.0f;
++        #pragma unroll
++        for (int hh = 0; hh < H; ++hh)
++            v = fmaf(rmr_s[r * H + hh], dr[(size_t) i * H + hh], v);
++        v *= inv_h;
++        t_s[idx] = v * sigmoidf_(v);
++    }
++    if (post && blockIdx.x == 0 && threadIdx.x < (unsigned) (R * H))
++    {
++        const int r = threadIdx.x / H;
++        const int hh = threadIdx.x % H;
++        const float* dr = dots + (size_t) r * nrows * H;
++        float v = 0.0f;
++        #pragma unroll
++        for (int hhh = 0; hhh < H; ++hhh)
++            v = fmaf(rmr_s[r * H + hhh], dr[(size_t) (LR + hh) * H + hhh], v);
++        post[threadIdx.x] = 2.0f * sigmoidf_(v * inv_h);
++    }
++    __syncthreads();
++
++    // Phase B: finalize, warp per (r, c-quad)
++    const int nq = R * D4;
++    for (int qq = gwarp; qq < nq; qq += nwarps)
++    {
++        const int r = qq / D4;
++        const int c = qq - r * D4;
++        const float* t_r = t_s + r * LR;
++        const float* rmr_r = rmr_s + r * H;
++        const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
++        float4 g[H];
++        #pragma unroll
++        for (int hh = 0; hh < H; ++hh) g[hh] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++        int i = lane;
++        for (; i + 96 < LR; i += 128)
++        {
++            int u[4][H];
++            #pragma unroll
++            for (int k = 0; k < 4; ++k)
++                #pragma unroll
++                for (int hh = 0; hh < H; ++hh)
++                    u[k][hh] = __ldcs((const int*) (up_q + ((((size_t) hh * D4 + c) * LR + i + 32 * k) * 4)));
++            #pragma unroll
++            for (int k = 0; k < 4; ++k)
++            {
++                float ti = t_r[i + 32 * k];
++                #pragma unroll
++                for (int hh = 0; hh < H; ++hh)
++                {
++                    const int8_t* qb = (const int8_t*) &u[k][hh];
++                    g[hh].x = fmaf(ti, (float) qb[0], g[hh].x);
++                    g[hh].y = fmaf(ti, (float) qb[1], g[hh].y);
++                    g[hh].z = fmaf(ti, (float) qb[2], g[hh].z);
++                    g[hh].w = fmaf(ti, (float) qb[3], g[hh].w);
++                }
++            }
++        }
++        for (; i < LR; i += 32)
++        {
++            float ti = t_r[i];
++            #pragma unroll
++            for (int hh = 0; hh < H; ++hh)
++            {
++                int u = __ldcs((const int*) (up_q + ((((size_t) hh * D4 + c) * LR + i) * 4)));
++                const int8_t* qb = (const int8_t*) &u;
++                g[hh].x = fmaf(ti, (float) qb[0], g[hh].x);
++                g[hh].y = fmaf(ti, (float) qb[1], g[hh].y);
++                g[hh].z = fmaf(ti, (float) qb[2], g[hh].z);
++                g[hh].w = fmaf(ti, (float) qb[3], g[hh].w);
++            }
++        }
++        #pragma unroll
++        for (int hh = 0; hh < H; ++hh)
++            for (int offset = 16; offset > 0; offset >>= 1)
++            {
++                g[hh].x += __shfl_xor_sync(0xffffffffu, g[hh].x, offset);
++                g[hh].y += __shfl_xor_sync(0xffffffffu, g[hh].y, offset);
++                g[hh].z += __shfl_xor_sync(0xffffffffu, g[hh].z, offset);
++                g[hh].w += __shfl_xor_sync(0xffffffffu, g[hh].w, offset);
++            }
++        if (lane != 0) continue;
++        float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++        #pragma unroll
++        for (int hh = 0; hh < H; ++hh)
++        {
++            float4 s = s4[(size_t) hh * D4 + c];
++            half4 wq = *(const half4*) (w + (size_t) hh * D + 4 * c);
++            float4 us = *(const float4*) (up_s + (size_t) hh * D + 4 * c);
++            float coef = rmr_r[hh] * inv_h;
++            o.x = fmaf(sigmoidf_(g[hh].x * us.x) * coef * LOW_TO_FLOAT(wq.x),  s.x, o.x);
++            o.y = fmaf(sigmoidf_(g[hh].y * us.y) * coef * HIGH_TO_FLOAT(wq.x), s.y, o.y);
++            o.z = fmaf(sigmoidf_(g[hh].z * us.z) * coef * LOW_TO_FLOAT(wq.y),  s.z, o.z);
++            o.w = fmaf(sigmoidf_(g[hh].w * us.w) * coef * HIGH_TO_FLOAT(wq.y), s.w, o.w);
++        }
++        if (HALF_OUT)
++        {
++            half2* out2 = (half2*) ((half*) mixed + (size_t) r * D);
++            out2[c * 2] = __floats2half2_rn(o.x, o.y);
++            out2[c * 2 + 1] = __floats2half2_rn(o.z, o.w);
++        }
++        else
++            ((float4*) ((float*) mixed + (size_t) r * D))[c] = o;
++    }
++}
++
++static bool gr_tuned_enabled()
++{
++    static const bool v = []()
++    {
++        const char* e = getenv("EXL3_GR_TUNED");
++        return e && e[0] == '1';
++    }();
++    return v;
++}
++
++// Resident-block count for the fused kernel, or 0 when cooperative launch is
++// unavailable (caller falls back to the stock two-kernel path). Queried with
++// the maximum smem footprint (GR_FUSED_MAX_R) so one count covers all R.
++static int gr_fused_blocks(int max_smem, bool half_out)
++{
++    static int cached[2] = { -1, -1 };
++    int slot = half_out ? 1 : 0;
++    if (cached[slot] >= 0) return cached[slot];
++    int dev, nsm, nb = 0, coop = 0;
++    cudaGetDevice(&dev);
++    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
++    cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev);
++    if (coop)
++    {
++        if (half_out)
++            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
++                &nb, gr_mix_fused_i8_kernel<4, true>, GR_FUSED_THREADS, max_smem);
++        else
++            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
++                &nb, gr_mix_fused_i8_kernel<4, false>, GR_FUSED_THREADS, max_smem);
++    }
++    cached[slot] = nb * nsm;
++    return cached[slot];
++}
++
+ void gr_mix_int8
+ (
+     const at::Tensor& streams,           // (R, H, D) float
+@@ -1616,6 +1882,40 @@ void gr_mix_int8
+     TORCH_CHECK(fn_s.numel() == M && up_s.numel() == H * D, "gr_mix_int8: scale shapes");
+     TORCH_CHECK(dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix_int8: dots shape");
+ 
++    if (gr_tuned_enabled() && R <= GR_FUSED_MAX_R && D % 16 == 0)
++    {
++        const bool hout = mixed.dtype() == at::kHalf;
++        int fused_smem = (R * LR + R * 4) * sizeof(float);
++        int nblocks = gr_fused_blocks((GR_FUSED_MAX_R * LR + GR_FUSED_MAX_R * 4) * sizeof(float), hout);
++        if (nblocks > 0)
++        {
++            const float* s_p = (const float*) streams.data_ptr();
++            const int8_t* fq_p = (const int8_t*) fn_q.data_ptr();
++            const float* fs_p = (const float*) fn_s.data_ptr();
++            const int8_t* uq_p = (const int8_t*) up_q.data_ptr();
++            const float* us_p = (const float*) up_s.data_ptr();
++            const half* w_p = (const half*) w.data_ptr();
++            float* d_p = (float*) dots.data_ptr();
++            float* post_p = post ? (float*) post.value().data_ptr() : nullptr;
++            void* mx_p = mixed.data_ptr();
++            float eps = (float) rms_eps;
++            void* args[] = { &s_p, &fq_p, &fs_p, &uq_p, &us_p, &w_p, &d_p, &post_p, &mx_p,
++                             (void*) &R, (void*) &M, (void*) &D, (void*) &LR, &eps };
++            cudaError_t err;
++            if (hout)
++                err = cudaLaunchCooperativeKernel(
++                    (void*) gr_mix_fused_i8_kernel<4, true>, dim3(nblocks),
++                    dim3(GR_FUSED_THREADS), args, fused_smem, stream);
++            else
++                err = cudaLaunchCooperativeKernel(
++                    (void*) gr_mix_fused_i8_kernel<4, false>, dim3(nblocks),
++                    dim3(GR_FUSED_THREADS), args, fused_smem, stream);
++            TORCH_CHECK(err == cudaSuccess, "gr_mix_int8 fused launch: ", cudaGetErrorString(err));
++            cuda_check(cudaPeekAtLastError());
++            return;
++        }
++    }
++
+     dim3 grid_a(M + 1, R);
+     gr_dots_i8_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
+     (
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index cb57a85..b964cf0 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -24,8 +24,85 @@ from ..tokenizer import MMEmbedding
+ from ..util import profile_opt
+ 
+ import os as _os
++import math as _math
+ _BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
+ _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
++# M1 shadow mode (docs/spec_sampling.md §3): observe-only expected spec-sampling
++# acceptance alongside the unchanged legacy match-verify
++_SPEC_SHADOW = _os.environ.get("EXL3_SPEC_SHADOW", "0") != "0"
++# Observe only every Nth draft window (1 = every window); the estimate stays unbiased
++_SPEC_SHADOW_EVERY = max(1, int(_os.environ.get("EXL3_SPEC_SHADOW_EVERY", "1")))
++# M2 exact speculative sampling (docs/spec_sampling.md §2): drafts sampled from the
++# shaped q, min(1, p/q) acceptance, (p-q)+ rejection resampling. Default off = master
++# behavior; jobs outside the supported sampler subset stay on legacy match-verify
++_SPEC_SAMPLING = _os.environ.get("EXL3_SPEC_SAMPLING", "0") != "0"
++# Temporary M2 diagnostics: aggregated per-position accept-test stats, logged every
++# 200 positions. Debug-only; not part of the shipped recipe
++_SPEC_DEBUG = _os.environ.get("EXL3_SPEC_DEBUG", "0") != "0"
++# Spec window cap (design §8.3): expected accepted-per-round a(1-a^w)/(1-a) saturates
++# fast (a=0.65: w=1: 0.65, w=2: 1.07, w=3: 1.35), while every extra position costs a
++# serial draft step plus a verify row (~5ms here) — live sweep: w=1 and w=2 roughly tie
++# baseline, w=3+ loses. The legacy calibrator's match-based thresholds don't apply to
++# spec acceptance, so spec rounds bypass it and cap the window here
++_SPEC_WINDOW = max(1, int(_os.environ.get("EXL3_SPEC_WINDOW", "1")))
++# Temporary M2 phase timing: wall ms spent in the draft loop / serial verify / shadow
++# observe per draft round, logged every 200 rounds. Debug-only; not part of the recipe
++_SPEC_TIMING = _os.environ.get("EXL3_SPEC_TIMING", "0") != "0"
++# Per-job adaptive engagement (design §8.6): spec only pays when the job's measured
++# acceptance clears the legacy break-even. _spec_verify_job evaluates the rolling rate
++# every EXL3_SPEC_ADAPT_ROUNDS; jobs below EXL3_SPEC_MIN_ACC return to legacy drafting
++# and re-probe after EXL3_SPEC_PROBE_ROUNDS legacy rounds
++_SPEC_ADAPTIVE = _os.environ.get("EXL3_SPEC_ADAPTIVE", "1") != "0"
++_SPEC_MIN_ACC = float(_os.environ.get("EXL3_SPEC_MIN_ACC", "0.55"))
++_SPEC_ADAPT_ROUNDS = max(1, int(_os.environ.get("EXL3_SPEC_ADAPT_ROUNDS", "16")))
++_SPEC_PROBE_ROUNDS = max(1, int(_os.environ.get("EXL3_SPEC_PROBE_ROUNDS", "128")))
++
++# M3 hybrid ngram+MTP drafting: per job and round, draft from the suffix-automaton
++# continuation when the longest suffix repeat reaches EXL3_NGRAM_MIN_MATCH and has
++# continuation left to copy (near-free, and long repeats in code/markup accept in long
++# runs), else fall back to the MTP draft. Both sources share the legacy match-verify.
++# Default off = master behavior; the mutually exclusive pure-ngram mode
++# (ngram_match_min) is untouched
++_HYBRID_NGRAM = _os.environ.get("EXL3_HYBRID_NGRAM", "0") != "0"
++_HYBRID_MIN_MATCH = max(1, int(_os.environ.get("EXL3_NGRAM_MIN_MATCH", "8")))
++# 7, not more: the target stack switches forward kernels at q_len > 8 (measured on
++# GB10: w=7 ~107 tok/s on exact-repeat content, w=8 collapses to ~46), and the legacy
++# serial verify charges per window position regardless
++_HYBRID_MAX_DRAFT = max(1, int(_os.environ.get("EXL3_NGRAM_MAX_DRAFT", "7")))
++_HYBRID_STATS = _os.environ.get("EXL3_HYBRID_STATS", "0") != "0"
++# Per-job adaptive ngram backoff: a long suffix repeat whose continuation diverges
++# (structural repeats with varying content, e.g. JSON records) wastes the wide window.
++# Evaluate each job's per-position ngram acceptance every EXL3_NGRAM_ADAPT_ROUNDS ngram
++# rounds; below EXL3_NGRAM_MIN_ACC the job falls back to MTP and re-probes after
++# EXL3_NGRAM_PROBE_ROUNDS rounds. 0.25 of a 16-wide window ≈ 4 tokens/round, roughly
++# the MTP round's expected yield here
++_HYBRID_ADAPTIVE = _os.environ.get("EXL3_NGRAM_ADAPTIVE", "1") != "0"
++_HYBRID_MIN_ACC = float(_os.environ.get("EXL3_NGRAM_MIN_ACC", "0.25"))
++_HYBRID_ADAPT_ROUNDS = max(1, int(_os.environ.get("EXL3_NGRAM_ADAPT_ROUNDS", "16")))
++_HYBRID_PROBE_ROUNDS = max(1, int(_os.environ.get("EXL3_NGRAM_PROBE_ROUNDS", "64")))
++# Padding token for rows drafted shorter than the round's combined window. A pad
++# position verifies like any draft position under match-verify: it accepts iff the
++# target happens to sample the pad token there (exact, just unlikely) and rejects the
++# remainder otherwise
++_HYBRID_PAD_TOKEN = 0
++
++
++def _hybrid_pad_rows(drafts: list, pad_token: int = _HYBRID_PAD_TOKEN) -> torch.Tensor:
++    """
++    Stack per-row (1, w_i) draft tensors of varying widths into one (rows, max_width)
++    tensor, padding short or missing (None) rows with pad_token.
++    """
++    width = 0
++    for d in drafts:
++        if d is not None:
++            width = max(width, d.shape[-1])
++    assert width >= 1, "hybrid draft assembly needs at least one non-empty row"
++    out = torch.full((len(drafts), width), pad_token, dtype = torch.long)
++    for r, d in enumerate(drafts):
++        if d is not None and d.shape[-1]:
++            out[r, :d.shape[-1]] = d[0]
++    return out
++
+ 
+ class Generator:
+ 
+@@ -256,10 +333,60 @@ class Generator:
+             draft_model.attach_to(model)
+         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
+         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
++        # M3 hybrid ngram+MTP drafting (EXL3_HYBRID_NGRAM). Requires the MTP drafter:
++        # ngram rounds rely on iterate_gen's MTP carry maintenance (target-hidden export
++        # is requested whenever a draft model is attached) so drafting can resume after
++        # any ngram streak. Incompatible with spec drafting — an ngram round has no
++        # draft q, and mixing per-row verify semantics mid-round leaves neither the
++        # M2-exact nor the legacy distribution — so spec sampling stays suppressed
++        # whenever hybrid is on (legacy match-verify throughout, i.e. baseline outputs)
++        self.hybrid_ngram = False
++        if _HYBRID_NGRAM:
++            if self.mtp_draft:
++                self.hybrid_ngram = True
++                if _SPEC_SAMPLING:
++                    logger.warning(
++                        "EXL3_HYBRID_NGRAM: EXL3_SPEC_SAMPLING suppressed (ngram rounds "
++                        "have no draft q; hybrid verifies legacy throughout)"
++                    )
++            else:
++                logger.warning(
++                    "EXL3_HYBRID_NGRAM requires an MTP draft model; ignoring "
++                    "(pure-ngram mode via ngram_match_min is unchanged)"
++                )
++        self.hybrid_ngram_min_match = _HYBRID_MIN_MATCH
++        self.hybrid_ngram_max = _HYBRID_MAX_DRAFT
++        if self.hybrid_ngram:
++            # Recurrent state history (GDN conv/state buffers) is sized by the frontend
++            # from the draft window (tabbyAPI: max_history = draft_num_tokens). A wider
++            # ngram window would overflow it, so clamp to what the cache can verify;
++            # the frontend should size max_history >= EXL3_NGRAM_MAX_DRAFT instead
++            max_hist = getattr(self.cache, "max_history", 0)
++            if max_hist and self.hybrid_ngram_max > max_hist:
++                logger.warning(
++                    "EXL3_HYBRID_NGRAM: cache max_history (%d) < EXL3_NGRAM_MAX_DRAFT "
++                    "(%d); clamping ngram draft width (recurrent state history)",
++                    max_hist, self.hybrid_ngram_max,
++                )
++                self.hybrid_ngram_max = max_hist
++        # Per-round hybrid state: row sources for accounting, ngram rows for the
++        # calibrator skip, spec suppression flag for mixed rounds
++        self._hybrid_round_src = None
++        self._hybrid_ngram_jobs = set()
++        self._hybrid_suppress_spec = False
++        self._hybrid_stats = {
++            "rounds": 0, "ng_rounds": 0,
++            "ng_drafted": 0, "ng_accepted": 0,
++            "mtp_drafted": 0, "mtp_accepted": 0,
++        }
+         # DFlash writes its full native block even when verification is shortened.
+         self.draft_reserve_tokens = self.num_draft_tokens
+         if self.dflash_draft:
+             self.draft_reserve_tokens = max(self.num_draft_tokens, self.draft_model.config.block_size - 1)
++        if self.hybrid_ngram:
++            # Ngram drafts run past num_draft_tokens; the job token budget must reserve
++            # page space for the wider window
++            self.draft_reserve_tokens = max(self.draft_reserve_tokens, self.hybrid_ngram_max)
+ 
+         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
+         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
+@@ -268,6 +395,17 @@ class Generator:
+         # leaving the calibrator inert
+         self.draft_calibrator = None
+         self._draft_conf_round = None
++        # M1 shadow mode: per-position draft log-prob rows for the window currently being
++        # verified (list of (batch, head_n) fp32 tensors), plus process-level counters
++        self._spec_shadow_logq = None
++        self._spec_shadow_stats = None
++        self._spec_shadow_errors = 0
++        self._spec_shadow_tick = 0
++        self._spec_shadow_diag = False
++        # M2: per-batch-row SpecTransform (or None) for the window being verified, and a
++        # one-shot flag for the calibrator-bypass notice
++        self._spec_draft_specs = None
++        self._spec_cal_warned = False
+         if draft_confidence is None:
+             draft_confidence = float(_os.environ.get("EXL3_DRAFT_CONFIDENCE", "0.4"))
+         self.draft_confidence = draft_confidence
+@@ -552,7 +690,10 @@ class Generator:
+                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
+                 self.iterate_gen(results, draft_tokens)
+             elif self.mtp_draft:
+-                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
++                if self.hybrid_ngram:
++                    draft_tokens = self.iterate_hybrid_gen(results)
++                else:
++                    draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                 self.iterate_gen(results, draft_tokens)
+             else:
+                 draft_tokens = self.iterate_draftmodel_gen(results)
+@@ -715,6 +856,14 @@ class Generator:
+     def iterate_draftmodel_mtp_gen(self, results: list):
+ 
+         self._draft_conf_round = None
++        self._spec_shadow_logq = None
++        self._spec_draft_specs = None
++        # Subsample under EXL3_SPEC_SHADOW_EVERY=N: only every Nth draft round exports
++        # logq and gets observed, so skipped rounds cost nothing at all
++        shadow = False
++        if _SPEC_SHADOW:
++            self._spec_shadow_tick += 1
++            shadow = self._spec_shadow_tick % _SPEC_SHADOW_EVERY == 0
+ 
+         # Get shape of active batch
+         batch_size = 0
+@@ -747,6 +896,7 @@ class Generator:
+         # Collect input IDs
+         input_ids_list = []
+         mtp_hidden_list = []
++        row_jobs = []
+         for job in self.active_jobs:
+             if not job.is_prefill_done(): continue
+             assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
+@@ -760,7 +910,39 @@ class Generator:
+             job_ids = job.get_input_ids_list()
+             input_ids_list += job_ids
+             mtp_hidden_list.append(job.mtp_last_hidden)
++            row_jobs.append(job)
+         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
++
++        # M2: per-row spec eligibility (EXL3_SPEC_SAMPLING). Eligible rows get drafts
++        # sampled from the shaped q and min(1, p/q) verification; ineligible rows keep
++        # argmax drafts and legacy match-verify. Stored for the verify loop, whose batch
++        # rows follow the same order.
++        specs = None
++        # Hybrid rounds with any ngram row suppress spec drafting so every row verifies
++        # with the same legacy semantics its draft was produced under (ngram drafts have
++        # no q to verify against)
++        if _SPEC_SAMPLING and not self._hybrid_suppress_spec:
++            from . import spec_sampling
++            specs = [spec_sampling.job_spec(job) for job in row_jobs]
++            if _SPEC_ADAPTIVE:
++                specs = [
++                    s if s is not None and self._spec_engaged(job) else None
++                    for job, s in zip(row_jobs, specs)
++                ]
++            if not any(specs):
++                specs = None
++            self._spec_draft_specs = specs
++            if _SPEC_DEBUG:
++                dbg = self._spec_dbg_counters()
++                dbg["rounds"] += 1
++                if specs is not None:
++                    dbg["spec_rounds"] += 1
++                    dbg["spec_rows"] += sum(1 for s in specs if s is not None)
++                if dbg["rounds"] % 100 == 0:
++                    logger.info(
++                        "spec-dbg-draft rounds=%d spec_rounds=%d spec_rows=%d",
++                        dbg["rounds"], dbg["spec_rounds"], dbg["spec_rows"],
++                    )
+         # Device-resident draft chain (EXL3_MTP_DEVICE_DRAFT): ids stay on the draft device
+         # between steps (the Embedding mirrors its table there), so the window costs one
+         # readback instead of one per drafted token
+@@ -773,13 +955,30 @@ class Generator:
+             batch_ids = self.draft_input_ids_pinned[:batch_size, :]
+             batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
+ 
+-        # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
+-        # every row's running product of estimated conditional acceptance probabilities falls
+-        # below the confidence target, keeping the first low-confidence token as the label probe
++        # Greedy sample batched draft tokens (spec-eligible rows sample from the shaped q
++        # instead). As in iterate_draftmodel_gen, drafting stops once every row's running
++        # product of estimated conditional acceptance probabilities falls below the
++        # confidence target, keeping the first low-confidence token as the label probe.
++        # With spec sampling the calibrator's match-based thresholds no longer apply
++        # (design §8.3): spec rounds bypass it and cap the window at EXL3_SPEC_WINDOW,
++        # past which the expected accepted-per-round has already saturated
+         window = self.num_draft_tokens
+         cal = self.draft_calibrator
++        if specs is not None:
++            window = min(window, _SPEC_WINDOW)
++            if cal is not None:
++                if not self._spec_cal_warned:
++                    self._spec_cal_warned = True
++                    logger.info(
++                        "spec-sampling: draft confidence calibrator bypassed for spec "
++                        "rounds (window capped at %d, design 8.3)", _SPEC_WINDOW,
++                    )
++                cal = None
+         conf_cols = []
+         reach = None
++        shadow_logq = None
++        want_q = shadow or specs is not None
++        _t0d = time.perf_counter() if _SPEC_TIMING else 0.0
+         for idx in range(window):
+             params = {
+                 "target_hidden": temp_hidden,
+@@ -790,10 +989,28 @@ class Generator:
+             }
+             if cal is not None:
+                 params["export_draft_conf"] = True
++            if want_q:
++                params["export_draft_logq"] = True
+             batch_state = self.draft_model.forward(batch_ids, params)
+             lm_head = self.model.modules[self.model.logit_layer_idx]
+             batch_state = lm_head.prepare_for_device(batch_state, params)
+             new_ids = self.draft_model.sample_from_state(batch_state, params)
++            if want_q:
++                logq = params.get("draft_logq")
++                if logq is not None:
++                    logq = logq.view(logq.shape[0], -1)
++                    if shadow_logq is None:
++                        shadow_logq = []
++                    shadow_logq.append(logq)
++                    if specs is not None:
++                        # Draft d_i ~ shaped q for spec-eligible rows (design §2.1); the
++                        # argmax rows are untouched. Draws are seeded from each job's rng
++                        # in position-major, row order for per-seed reproducibility.
++                        new_ids = new_ids.clone()
++                        for r, s in enumerate(specs):
++                            if s is None: continue
++                            seed = row_jobs[r].rng.randint(0, (1 << 32) - 1)
++                            new_ids[r, 0] = spec_sampling.q_sample(logq[r], seed)[0]
+             if dev_draft:
+                 dev_draft_ids[:, idx:idx+1] = new_ids
+                 batch_ids = new_ids
+@@ -812,6 +1029,17 @@ class Generator:
+                     window = idx + 1
+                     break
+ 
++        if _SPEC_TIMING:
++            torch.cuda.synchronize()
++            _td = self._spec_timers()
++            _td["rounds"] += 1
++            _td["draft"] += time.perf_counter() - _t0d
++            if _td["rounds"] % 200 == 0:
++                self._spec_timers_log(_td)
++
++        if want_q:
++            self._spec_shadow_logq = shadow_logq
++
+         if dev_draft:
+             # one readback for the whole window
+             self.draft_ids_pinned[:batch_size, :window].copy_(dev_draft_ids[:, :window])
+@@ -957,6 +1185,192 @@ class Generator:
+         return draft_ids
+ 
+ 
++    def iterate_hybrid_gen(self, results: list):
++        """
++        M3 hybrid ngram+MTP drafting (EXL3_HYBRID_NGRAM). Every round, each job drafts
++        from its suffix-automaton continuation when the automaton finds a repeat of at
++        least EXL3_NGRAM_MIN_MATCH tokens with continuation left to copy, and falls back
++        to the MTP draft otherwise. Both sources share the legacy match-verify in
++        iterate_gen, so outputs keep baseline (non-spec) semantics.
++
++        MTP state alignment — why ngram rounds are safe mid-stream: the MTP carry
++        (job.mtp_last_hidden) and the draft KV are both maintained by iterate_gen from
++        the TARGET forward, not by the drafter. draft_verifier_params are added to the
++        target forward whenever a draft model is attached (regardless of the draft
++        source), and the post-verify draft_model.prefill writes the accepted tokens —
++        whoever proposed them — into the draft cache, then re-pairs mtp_last_hidden with
++        the last accepted position. An ngram round therefore advances the MTP state
++        exactly like an MTP round, and MTP drafting resumes on any later round from a
++        consistent carry. The drafter's own speculative KV positions are position-indexed
++        scratch rewritten every round, so the skipped draft forward leaves nothing stale.
++        """
++        self._hybrid_round_src = {}
++        self._hybrid_ngram_jobs = set()
++        self._hybrid_suppress_spec = False
++
++        # Probe every prefill-done job's SAM. accept_tensor consumes the job's history
++        # incrementally (it tracks its own offset and rebuilds on rewind), so probing
++        # every round keeps the automaton current across arbitrary ngram/MTP
++        # interleavings; a probe that doesn't qualify still did that bookkeeping.
++        ordered = [job for job in self.active_jobs if job.is_prefill_done()]
++        if not ordered:
++            self._hybrid_round_src = None
++            return None
++        candidates = {}
++        for job in ordered:
++            assert len(job.sequences) == 1, \
++                "Hybrid ngram drafting does not support CFG/multi-sequence jobs"
++            if getattr(job, "sam", None) is None:
++                continue
++            draft, _match_len = job.probe_ngram_draft(
++                self.hybrid_ngram_max, self.hybrid_ngram_min_match
++            )
++            if draft.shape[-1] >= 1 and self._hybrid_ng_engaged(job):
++                candidates[id(job)] = draft
++
++        st = self._hybrid_stats
++        st["rounds"] += 1
++
++        if not candidates:
++            # Pure MTP round — identical to the un-hybrid path
++            draft_tokens = self.iterate_draftmodel_mtp_gen(results)
++            if draft_tokens is not None:
++                w = draft_tokens.shape[-1]
++                for job in ordered:
++                    self._hybrid_round_src[id(job)] = ("mtp", w)
++            return draft_tokens
++
++        st["ng_rounds"] += 1
++
++        if len(candidates) < len(ordered):
++            # Mixed round: run the regular full-batch MTP draft, then overwrite the ngram
++            # rows. Sub-batching the drafter would save one small forward but desync the
++            # confidence calibrator's and shadow's row maps; the draft forward is ~4 ms
++            # against a ~34 ms target-forward floor. Spec drafting is suppressed for the
++            # round so every row is verified with the same legacy semantics its draft was
++            # produced under (an ngram draft has no q; a q-sampled MTP row verified
++            # hard-match would leave both the M2-exact and the legacy distributions).
++            self._hybrid_suppress_spec = True
++            try:
++                mtp_tokens = self.iterate_draftmodel_mtp_gen(results)
++            finally:
++                self._hybrid_suppress_spec = False
++            # The shadow's logq rows describe the MTP drafts just discarded on the ngram
++            # rows; pairing them with the overwritten drafts would corrupt the estimate
++            self._spec_shadow_logq = None
++            self._spec_draft_specs = None
++            drafts = []
++            for r, job in enumerate(ordered):
++                cand = candidates.get(id(job))
++                if cand is not None:
++                    drafts.append(cand)
++                    self._hybrid_round_src[id(job)] = ("ngram", cand.shape[-1])
++                    self._hybrid_ngram_jobs.add(id(job))
++                elif mtp_tokens is not None:
++                    drafts.append(mtp_tokens[r:r + 1])
++                    self._hybrid_round_src[id(job)] = ("mtp", mtp_tokens.shape[-1])
++                else:
++                    # No MTP carry this round (e.g. first round after enqueue): an
++                    # all-pad row verifies as an immediate mismatch, i.e. one plain token
++                    drafts.append(None)
++            return _hybrid_pad_rows(drafts)
++
++        # Pure ngram round: skip the MTP draft forward entirely (the common case on
++        # repetitive content). Clear the per-round draft-model state so the shadow and
++        # the calibrator never consume stale rows from an earlier MTP round.
++        self._spec_shadow_logq = None
++        self._spec_draft_specs = None
++        self._draft_conf_round = None
++        drafts = []
++        for job in ordered:
++            cand = candidates[id(job)]
++            drafts.append(cand)
++            self._hybrid_round_src[id(job)] = ("ngram", cand.shape[-1])
++            self._hybrid_ngram_jobs.add(id(job))
++        return _hybrid_pad_rows(drafts)
++
++
++    def _hybrid_ng_engaged(self, job):
++        """
++        Per-job adaptive ngram engagement (EXL3_NGRAM_ADAPTIVE). True while the job's
++        ngram drafts pay; False after its measured per-position acceptance fell below
++        EXL3_NGRAM_MIN_ACC, in which case it drafts MTP and re-probes after
++        EXL3_NGRAM_PROBE_ROUNDS rounds. State lives on the job and dies with it.
++        """
++        if not _HYBRID_ADAPTIVE:
++            return True
++        if getattr(job, "_ng_on", True):
++            return True
++        n = getattr(job, "_ng_off_rounds", 0) + 1
++        if n >= _HYBRID_PROBE_ROUNDS:
++            job._ng_on = True
++            job._ng_eval_n = 0
++            job._ng_eval_k = 0
++            n = 0
++            logger.info("hybrid: job %s ngram re-engaged (probe)", job.serial_number)
++        job._ng_off_rounds = n
++        return job._ng_on
++
++
++    def _hybrid_account(self, logit_mapping, accepted_lengths, rewound_jobs):
++        """
++        Per-source drafted/accepted accounting for EXL3_HYBRID_STATS, hooked after the
++        verify loop where accepted_lengths is complete. Abandoned (rewound) windows are
++        skipped, as in draft_stats.
++        """
++        src = self._hybrid_round_src
++        self._hybrid_round_src = None
++        if not src:
++            return
++        st = self._hybrid_stats
++        row = 0
++        for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
++            if a == b:
++                continue
++            accepted_length = accepted_lengths[row]
++            row += 1
++            s = src.get(id(job))
++            if s is None or id(job) in rewound_jobs:
++                continue
++            kind, width = s
++            # accepted_length - 1 can exceed the row's real draft width only through a
++            # lucky pad-token match; clamp so pad positions never count as drafted
++            acc = max(0, min(accepted_length - 1, width))
++            if kind == "ngram":
++                st["ng_drafted"] += width
++                st["ng_accepted"] += acc
++                # Adaptive engagement input (EXL3_NGRAM_ADAPTIVE): rolling per-position
++                # acceptance, evaluated every EXL3_NGRAM_ADAPT_ROUNDS ngram rounds
++                if _HYBRID_ADAPTIVE:
++                    r = getattr(job, "_ng_eval_rounds", 0) + 1
++                    n = getattr(job, "_ng_eval_n", 0) + width
++                    k = getattr(job, "_ng_eval_k", 0) + acc
++                    if r >= _HYBRID_ADAPT_ROUNDS:
++                        if n and k / n < _HYBRID_MIN_ACC:
++                            job._ng_on = False
++                            job._ng_off_rounds = 0
++                            logger.info(
++                                "hybrid: job %s ngram disengaged (acc %.3f < %.3f)",
++                                job.serial_number, k / n, _HYBRID_MIN_ACC,
++                            )
++                        r = n = k = 0
++                    job._ng_eval_rounds = r
++                    job._ng_eval_n = n
++                    job._ng_eval_k = k
++            else:
++                st["mtp_drafted"] += width
++                st["mtp_accepted"] += acc
++        if _HYBRID_STATS and st["rounds"] % 50 == 0:
++            # Short single line: TabbyAPI wraps log records at console width
++            logger.info(
++                "hybrid-stats r=%d ng=%.2f na=%.3f ma=%.3f",
++                st["rounds"],
++                st["ng_rounds"] / st["rounds"],
++                st["ng_accepted"] / max(st["ng_drafted"], 1),
++                st["mtp_accepted"] / max(st["mtp_drafted"], 1),
++            )
++
++
+     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
+         """
+         Reusable pinned staging buffer, keyed by name and row width, grown by rows on demand.
+@@ -971,8 +1385,433 @@ class Generator:
+         return buf[:rows]
+ 
+ 
++    def _spec_shadow_observe(
++        self,
++        batch_logits: torch.Tensor,
++        draft_tokens: torch.Tensor,
++        logit_mapping: list,
++        accepted_lengths: list,
++        rewound_jobs: set,
++    ):
++        # Shadow mode is observe-only: a measurement bug must never kill generation, so any
++        # exception is contained here, logged with rate limiting, and the window skipped
++        try:
++            self._spec_shadow_observe_inner(
++                batch_logits, draft_tokens, logit_mapping, accepted_lengths, rewound_jobs
++            )
++        except Exception as e:
++            n = self._spec_shadow_errors + 1
++            self._spec_shadow_errors = n
++            if n == 1 or n % 100 == 0:
++                logger.warning(
++                    "spec-shadow: observation failed (%d total); skipping window: %s: %s",
++                    n, type(e).__name__, e,
++                )
++
++
++    def _spec_shadow_observe_inner(
++        self,
++        batch_logits: torch.Tensor,
++        draft_tokens: torch.Tensor,
++        logit_mapping: list,
++        accepted_lengths: list,
++        rewound_jobs: set,
++    ):
++        """
++        M1 shadow mode (docs/spec_sampling.md §3): for every TESTED window position
++        (accepted prefix plus the one rejecting position), compute the expected
++        spec-sampling acceptance sum_x min(p(x), q(x)) under four q shapings, and log
++        per-interval and running-total means next to the accept hit rate. Pure
++        observation; runs after the verify has fully resolved the window and must not
++        touch job state.
++
++        Tested-basis (§8.5): the per-position past is the window-start prefix plus the
++        accepted draft continuation — exactly what the spec verifier conditions p_i on —
++        so the logged q means are the true per-position expected acceptance and the hit
++        rate m must approach them (up to RNG noise) whenever the spec path is healthy.
++        Positions past the cut are excluded: no real accepted prefix exists there, and
++        including them made m and q incomparable (geometric decay vs per-position mean).
++        """
++        from . import spec_sampling
++
++        logq_rows = self._spec_shadow_logq
++        window = draft_tokens.shape[-1]
++        if len(logq_rows) < window:
++            return
++        stats = self._spec_shadow_stats
++        if stats is None:
++            stats = self._spec_shadow_stats = {
++                "windows": 0, "positions": 0, "match": 0, "acc": None,
++                # Same counters for the interval since the last log line, so workloads can
++                # be attributed per phase (code / prose / long context)
++                "i_windows": 0, "i_positions": 0, "i_match": 0, "i_acc": None,
++            }
++        device = batch_logits.device
++        vocab_size = self.tokenizer.actual_vocab_size
++
++        j = 0
++        for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
++            if a == b: continue
++            accepted_length = accepted_lengths[j]
++            jj = j
++            j += 1
++
++            # Same eligibility as the M2 spec path (spec_sampling.job_spec): anything
++            # that makes the per-position distribution depend on state the shadow doesn't
++            # model (filters, forced tokens, masks, prob exports, multi-sequence,
++            # healing) or a sampler stack outside the supported subset skips
++            if id(job) in rewound_jobs:
++                continue
++
++            spec = spec_sampling.job_spec(job)
++            if not self._spec_shadow_diag:
++                # One-time startup diagnostic: proves the draft-side logq arrived and
++                # shows what the live sampler stack actually looks like
++                self._spec_shadow_diag = True
++                logger.info(
++                    "spec-shadow: first observe, logq_rows=%d window=%d steps=[%s] spec=%s",
++                    len(logq_rows), window,
++                    ", ".join(type(s).__name__ for s in getattr(job.sampler, "steps", None) or []),
++                    spec,
++                )
++            if spec is None:
++                continue
++
++            if stats["acc"] is None:
++                stats["acc"] = torch.zeros(4, dtype = torch.float64, device = device)
++                stats["i_acc"] = torch.zeros(4, dtype = torch.float64, device = device)
++
++            seq = job.sequences[0]
++            # The verify (legacy or spec) already resolved this window: sequence_ids now
++            # holds the window-start sequence plus the k accepted drafts and the token
++            # sampled at the cut. Trim those k+1 tokens to recover the window-start
++            # prefix; the per-position past is then prefix + drafts d_0..d_{i-1}, which
++            # is EXACTLY the prefix the spec verifier conditions p_i on for every
++            # position it tests. Only tested positions are counted (accepted prefix plus
++            # the one rejecting position), so the logged m (accept hit rate) and the q
++            # means (per-position expected acceptance) share one basis and are directly
++            # comparable. sequence_ids.torch() is (1, seq_len) — the same (1, n) shape
++            # the live sampler receives as past_ids — so keep the continuation 2D as well
++            base_ids = seq.sequence_ids.torch().to(device, non_blocking = True)
++            if base_ids.dim() == 1:
++                base_ids = base_ids.unsqueeze(0)
++            k = accepted_length - 1
++            drafts = draft_tokens[jj:jj + 1, :window].to(device, non_blocking = True)
++            prefix_len = base_ids.shape[-1] - (k + 1)
++            if prefix_len < 1:
++                continue
++            prefix = base_ids[:, :prefix_len]
++            tested = min(k + 1, window)
++
++            # Accumulate per job and commit to the shared counters only after the position
++            # loop completes, so a contained exception mid-window can't skew the means
++            job_acc = torch.zeros(4, dtype = torch.float64, device = device)
++            for i in range(tested):
++                past = torch.cat((prefix, drafts[:, :i]), dim = -1) if i else prefix
++                logits_row = batch_logits[a, i].float()
++                if vocab_size < logits_row.shape[-1]:
++                    logits_row[vocab_size:] = -float("inf")
++                logp = spec_sampling.spec_transform(logits_row, past, spec)
++                logq = logq_rows[i][jj].to(device)
++                job_acc += spec_sampling.shadow_overlaps(logp, logq).to(torch.float64)
++
++            stats["acc"] += job_acc
++            stats["i_acc"] += job_acc
++            stats["match"] += k
++            stats["positions"] += tested
++            stats["windows"] += 1
++            stats["i_match"] += k
++            stats["i_positions"] += tested
++            stats["i_windows"] += 1
++            if stats["windows"] % 50 == 0:
++                # Means are per-position (denominator = draft positions, not windows),
++                # same basis for the interval and the running total; one sync for both.
++                # TabbyAPI wraps log records at console width (~56 message chars after the
++                # prefix), so keep each record short enough to stay on one line:
++                # q = q_t1.0, q_t0.8, q_t0.6, q_shaped
++                vals = torch.cat((
++                    stats["i_acc"] / max(stats["i_positions"], 1),
++                    stats["acc"] / max(stats["positions"], 1),
++                )).tolist()
++                logger.info(
++                    "spec-shadow-i w=%d m=%.3f q=%.3f,%.3f,%.3f,%.3f",
++                    stats["i_windows"],
++                    stats["i_match"] / max(stats["i_positions"], 1),
++                    vals[0], vals[1], vals[2], vals[3],
++                )
++                logger.info(
++                    "spec-shadow-t w=%d m=%.3f q=%.3f,%.3f,%.3f,%.3f",
++                    stats["windows"],
++                    stats["match"] / max(stats["positions"], 1),
++                    vals[4], vals[5], vals[6], vals[7],
++                )
++                stats["i_windows"] = 0
++                stats["i_positions"] = 0
++                stats["i_match"] = 0
++                stats["i_acc"].zero_()
++
++
++    def _spec_engaged(self, job):
++        """
++        Per-job adaptive spec engagement (design §8.6). True while the job drafts from
++        shaped q; False after its measured acceptance fell below EXL3_SPEC_MIN_ACC, in
++        which case it keeps legacy drafting and re-probes every EXL3_SPEC_PROBE_ROUNDS
++        draft rounds. State lives on the job and dies with it.
++        """
++        if getattr(job, "_spec_on", True):
++            return True
++        n = getattr(job, "_spec_legacy_rounds", 0) + 1
++        if n >= _SPEC_PROBE_ROUNDS:
++            job._spec_on = True
++            job._spec_eval_n = 0
++            job._spec_eval_k = 0
++            n = 0
++            logger.info("spec-sampling: job %s re-engaged (probe)", job.serial_number)
++        job._spec_legacy_rounds = n
++        return job._spec_on
++
++    def _spec_timers(self):
++        # Temporary M2 phase timing (EXL3_SPEC_TIMING); remove with the spec-timing log sites
++        t = getattr(self, "_spec_timers_d", None)
++        if t is None:
++            t = self._spec_timers_d = {
++                "rounds": 0, "draft": 0.0, "genpre": 0.0, "verify": 0.0, "shadow": 0.0,
++            }
++        return t
++
++    def _spec_timers_log(self, t):
++        n = t["rounds"]
++        logger.info(
++            "spec-timing r=%d d=%.1f g=%.1f v=%.1f s=%.1f",
++            n, t["draft"] / n * 1000, t["genpre"] / n * 1000,
++            t["verify"] / n * 1000, t["shadow"] / n * 1000,
++        )
++
++    def _spec_dbg_counters(self):
++        # Temporary M2 diagnostics (EXL3_SPEC_DEBUG); remove with the spec-dbg log sites
++        dbg = getattr(self, "_spec_dbg", None)
++        if dbg is None:
++            dbg = self._spec_dbg = {
++                "n": 0, "acc": 0, "ovl": 0.0, "qd": 0.0, "pd": 0.0,
++                "d_amq": 0, "d_amp": 0, "qam": 0.0, "pamq": 0.0,
++                "pos_n": [0] * 16, "pos_acc": [0] * 16,
++                "rounds": 0, "spec_rounds": 0, "spec_rows": 0,
++            }
++        return dbg
++
++    def _spec_verify_job(
++        self,
++        job,
++        j: int,
++        job_logits: torch.Tensor,
++        draft_tokens: torch.Tensor,
++        batch_states,
++        results: list,
++        rewound_jobs: set,
++        completed_jobs: list,
++        requeuing_jobs: list,
++        reject_remainder,
++    ):
++        """
++        Exact speculative verification of one job's window (design §2). All window p_i
++        are computed up front in one batched pass with OPTIMISTIC prefixes (past_i =
++        window-start past + d_0..d_{i-1}): position i is only ever tested when drafts
++        0..i-1 were accepted, so the optimistic prefix equals the true accepted prefix
++        at every tested position. The accept walk itself is scalar CPU: draft d_i is
++        accepted iff log u < min(0, logp(d_i) - logq(d_i)); on rejection a token drawn
++        from renorm((p_i - q)+) is emitted and the window is cut. The output
++        distribution is exactly p regardless of q (Leviathan et al. 2023); q only
++        affects speed.
++
++        Token/state bookkeeping (accepted_length, reject_remainder, EOS / requeue /
++        banned-string-rewind handling, checkpoint boundaries) mirrors the legacy serial
++        loop branch-for-branch, so the post-batch MTP carry keyed on accepted_lengths —
++        draft-cache realignment and mtp_last_hidden pointing at the last ACCEPTED
++        position (design §8.2) — applies unchanged. RNG draws come from job.rng in a
++        fixed serial order: per-position accept u, then the residual draw on rejection.
++        Returns (accepted_length, rejected) with the same semantics as the legacy loop.
++        """
++        from . import spec_sampling
++
++        spec = self._spec_draft_specs[j]
++        logq_rows = self._spec_shadow_logq
++        window = draft_tokens.shape[-1]
++        device = job_logits.device
++        vocab_size = self.tokenizer.actual_vocab_size
++        accepted_length = 1
++        rejected = 0
++        use_past = spec.rep_p != 1.0
++        dbg = None
++        if _SPEC_DEBUG:
++            dbg = self._spec_dbg_counters()
++
++        # Batched optimistic p for the whole window: position i's past is the window-start
++        # past plus drafts d_0..d_{i-1}, which is exactly the accepted prefix for every
++        # position the walk below actually tests (a position is only reached when all
++        # previous drafts were accepted). Rows past the first rejection are computed but
++        # discarded. The rep penalty only reads the last sustain+decay+1 past tokens, so
++        # only that tail is captured (sliced indexing preserves the distance math). The
++        # whole window then costs one transform launch batch and one scalar readback
++        # instead of a GPU->CPU sync storm per position.
++        drafts_row = draft_tokens[j, :window]
++        d_gpu = drafts_row.to(device, non_blocking = True)
++        logits_2d = job_logits[0, :window].float()
++        if vocab_size < logits_2d.shape[-1]:
++            logits_2d[:, vocab_size:] = -float("inf")
++        n2 = logq_rows[0].shape[-1]
++        logq_2d = spec_sampling.shaped_q(
++            torch.stack([logq_rows[i][j] for i in range(window)]).to(device, non_blocking = True)
++        )
++        pasts = [None] * window
++        if use_past:
++            base = job.current_device_ids
++            if base is not None and base.numel():
++                tail = base.view(-1)[-(spec.sustain_range + spec.decay_range + 1):].to(device)
++                pasts = [torch.cat((tail, d_gpu[:i])) for i in range(window)]
++        logp_2d = spec_sampling.spec_transform_batched(logits_2d, pasts, spec)
++        arange = torch.arange(window, device = device)
++        in_slice = d_gpu < n2
++        logpd = logp_2d[arange, d_gpu]
++        # q is zero outside the pruned-head slice; such drafts accept with probability 1
++        # (logq = -inf there), and are never produced by q-sampled rows anyway
++        logqd = torch.where(
++            in_slice,
++            logq_2d[arange, d_gpu.clamp(max = n2 - 1)],
++            torch.full_like(logpd, -float("inf")),
++        )
++        thresh = torch.minimum(torch.zeros_like(logpd), logpd - logqd).cpu()
++
++        for i in range(job_logits.shape[1]):
++            token_logits = job_logits[:, i:i + 1, :]
++            next_k_tokens = next_k_probs = next_prob = None
++
++            if i < window:
++                accepted = _math.log(job.rng.random()) < float(thresh[i])
++                if dbg is not None:
++                    logp = logp_2d[i]
++                    logq = logq_2d[i]
++                    d = int(drafts_row[i])
++                    pp = logp.exp()
++                    pq = logq.exp()
++                    am_q = int(pq.argmax())
++                    am_p = int(pp.argmax())
++                    dbg["n"] += 1
++                    dbg["acc"] += int(accepted)
++                    dbg["ovl"] += float(torch.minimum(pp[:n2], pq).sum())
++                    dbg["qd"] += float(pq[d]) if d < n2 else 0.0
++                    dbg["pd"] += float(pp[d])
++                    dbg["d_amq"] += int(d == am_q)
++                    dbg["d_amp"] += int(d == am_p)
++                    dbg["qam"] += float(pq[am_q])
++                    dbg["pamq"] += float(pp[am_q])
++                    if i < 16:
++                        dbg["pos_n"][i] += 1
++                        dbg["pos_acc"][i] += int(accepted)
++                    if dbg["n"] % 200 == 0:
++                        n_ = dbg["n"]
++                        pa = [f"{a_}/{b_}" for a_, b_ in zip(dbg["pos_acc"][:8], dbg["pos_n"][:8])]
++                        logger.info(
++                            "spec-dbg n=%d acc=%.3f ovl=%.3f qd=%.3f pd=%.3f",
++                            n_, dbg["acc"] / n_, dbg["ovl"] / n_, dbg["qd"] / n_, dbg["pd"] / n_,
++                        )
++                        logger.info(
++                            "spec-dbg d=amq:%.2f d=amp:%.2f qam=%.3f pamq=%.3f pos=%s",
++                            dbg["d_amq"] / n_, dbg["d_amp"] / n_, dbg["qam"] / n_,
++                            dbg["pamq"] / n_, ",".join(pa),
++                        )
++                if accepted:
++                    next_token = draft_tokens[j, i].view(1, 1)
++                else:
++                    probs = spec_sampling.spec_residual_probs(logp_2d[i], logq_2d[i])
++                    gen = torch.Generator(device = device)
++                    gen.manual_seed(job.rng.randint(0, (1 << 32) - 1))
++                    next_token = torch.multinomial(probs, 1, generator = gen).view(1, 1)
++            else:
++                # Full window accepted: the bonus token is a plain sample from the real
++                # sampler stack, distribution p by construction
++                next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
++                    token_logits,
++                )
++
++            eos, sampled_token, rq = job.receive_sample(
++                token_logits,
++                next_token,
++                next_k_tokens,
++                next_k_probs,
++                next_prob,
++                results,
++            )
++
++            # Requeue: unconsumed draft positions must be rejected so the recurrent state
++            # and page positions match the accepted sequence before the requeue stash
++            if len(job.sequences) == 1 and rq:
++                rejected = reject_remainder(job, j, i, batch_states)
++                requeuing_jobs.append(job)
++                break
++
++            # EOS: draft positions from here on were fed to verification but never
++            # resolved; count them as rejected (no cache/state rollback needed)
++            if eos:
++                num_unresolved = job_logits.shape[1] - 1 - i
++                if num_unresolved:
++                    job.rejected_draft_tokens += num_unresolved
++                    for r_ in reversed(results):
++                        if r_.get("eos") and r_["job"] is job:
++                            if "rejected_draft_tokens" in r_:
++                                r_["rejected_draft_tokens"] = job.rejected_draft_tokens
++                            break
++                completed_jobs.append(job)
++                break
++
++            # Banned-string rewind: the remaining positions extend a sequence that no
++            # longer exists; abandon them (everything is already consistent)
++            if job.checkpoint_rewound:
++                job.checkpoint_rewound = False
++                rewound_jobs.add(id(job))
++                job.rejected_draft_tokens += job_logits.shape[1] - 1 - i
++                rejected = -1
++                break
++
++            if i < window:
++                # A recurrent checkpoint boundary stops draft acceptance so state can be
++                # stashed at an exact page boundary (as in the legacy loop)
++                cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
++                if not accepted or cp_boundary:
++                    rejected = reject_remainder(job, j, i, batch_states)
++                    break
++
++                job.accepted_draft_tokens += 1
++                accepted_length += 1
++
++                # Spec-eligible jobs have no filters; advance masks and past IDs so the
++                # next position's p (and the bonus-row sampler call) see the prefix
++                job.prepare_logit_mask()
++                job.prepare_sampling_past_ids()
++
++        if _SPEC_ADAPTIVE:
++            # Rolling acceptance for the engagement gate (design §8.6): evaluate every
++            # EXL3_SPEC_ADAPT_ROUNDS spec rounds; below EXL3_SPEC_MIN_ACC the job drafts
++            # legacy-style until its next probe
++            n = getattr(job, "_spec_eval_n", 0) + 1
++            k = getattr(job, "_spec_eval_k", 0) + accepted_length - 1
++            if n >= _SPEC_ADAPT_ROUNDS:
++                if k / n < _SPEC_MIN_ACC:
++                    job._spec_on = False
++                    job._spec_legacy_rounds = 0
++                    logger.info(
++                        "spec-sampling: job %s disengaged (acc %.3f < %.3f)",
++                        job.serial_number, k / n, _SPEC_MIN_ACC,
++                    )
++                n = k = 0
++            job._spec_eval_n = n
++            job._spec_eval_k = k
++
++        return accepted_length, rejected
++
++
+     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
+ 
++        _t0g = time.perf_counter() if _SPEC_TIMING else 0.0
+         # Get shape of active batch
+         # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
+         # determines how many cache pages the temporary block table needs for this iteration.
+@@ -1185,12 +2024,46 @@ class Generator:
+         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
+         # must advance between positions.
+         else:
++            if _SPEC_TIMING:
++                torch.cuda.synchronize()
++                self._spec_timers()["genpre"] += time.perf_counter() - _t0g
++            _t0v = time.perf_counter() if _SPEC_TIMING else 0.0
++            # M2 exact speculative sampling (EXL3_SPEC_SAMPLING): engages per job when the
++            # draft round carried per-row specs and q rows; everything else takes the
++            # legacy match-verify body below
++            spec_round = (
++                _SPEC_SAMPLING and draft_tokens is not None and
++                self._spec_draft_specs is not None and
++                self._spec_shadow_logq is not None and
++                len(self._spec_shadow_logq) >= draft_tokens.shape[-1]
++            )
+             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+                 if a == b: continue
+                 job_logits = batch_logits[a:b, :, :]
+                 accepted_length = 1
+                 rejected = 0
+ 
++                if (
++                    spec_round and j < len(self._spec_draft_specs) and
++                    self._spec_draft_specs[j] is not None and id(job) not in rewound_jobs
++                ):
++                    accepted_length, rejected = self._spec_verify_job(
++                        job, j, job_logits, draft_tokens, batch_states, results,
++                        rewound_jobs, completed_jobs, requeuing_jobs, reject_remainder,
++                    )
++                    # Same post-window tail as the legacy body below
++                    if batch_states and rejected == 0:
++                        batch_states[j].rewind(0)
++                    if rejected != -1 and self.record_draft_stats:
++                        job.draft_stats.append((
++                            job.new_tokens,
++                            draft_tokens.shape[-1],
++                            accepted_length - 1,
++                        ))
++                    accepted_lengths.append(accepted_length)
++                    j += 1
++                    continue
++
+                 # Batched verify (EXL3_BATCH_VERIFY): sample every position of the verification
+                 # window in one sampler call and compare against the draft on-device, so the
+                 # round pays one launch->readback sync instead of one per position. Only for
+@@ -1324,6 +2197,27 @@ class Generator:
+                 accepted_lengths.append(accepted_length)
+                 j += 1
+ 
++            if _SPEC_TIMING:
++                torch.cuda.synchronize()
++                self._spec_timers()["verify"] += time.perf_counter() - _t0v
++
++            # M3 hybrid (EXL3_HYBRID_NGRAM): per-source drafted/accepted accounting.
++            # Runs before the shadow so its per-round source map is consumed regardless
++            # of what the shadow does
++            if self._hybrid_round_src is not None:
++                self._hybrid_account(logit_mapping, accepted_lengths, rewound_jobs)
++
++            # M1 shadow (EXL3_SPEC_SHADOW): observe-only. The legacy match-verify above has
++            # fully resolved the window; this estimates what exact speculative sampling
++            # would have accepted. Never touches job state or emitted tokens.
++            if _SPEC_SHADOW and draft_tokens is not None and self._spec_shadow_logq is not None:
++                _t0s = time.perf_counter() if _SPEC_TIMING else 0.0
++                self._spec_shadow_observe(
++                    batch_logits, draft_tokens, logit_mapping, accepted_lengths, rewound_jobs
++                )
++                if _SPEC_TIMING:
++                    self._spec_timers()["shadow"] += time.perf_counter() - _t0s
++
+         # Update the draft-confidence calibration with this round's verification outcomes (any
+         # draft-model mode)
+         if self.draft_calibrator is not None and self._draft_conf_round is not None:
+@@ -1339,7 +2233,17 @@ class Generator:
+                 row += 1
+                 if id(job) in rewound_jobs:
+                     continue
++                # Hybrid rounds: ngram rows overwrote this row's MTP drafts before
++                # verify, so its conf/ids pairs were never tested — labeling them would
++                # drift the calibrator
++                if id(job) in self._hybrid_ngram_jobs:
++                    continue
+                 a = accepted_length - 1
++                # Hybrid mixed rounds pad rows past their real draft width; labels exist
++                # only for real drafted positions (a pad-token acceptance is a real
++                # accepted token but has no conf entry)
++                if self.hybrid_ngram:
++                    a = min(a, conf.shape[-1])
+                 for i in range(a):
+                     cal.add_label(conf[i].item(), True)
+                 if a < conf.shape[-1]:
+diff --git a/exllamav3/generator/job.py b/exllamav3/generator/job.py
+index 4e455c0..afc9329 100644
+--- a/exllamav3/generator/job.py
++++ b/exllamav3/generator/job.py
+@@ -1173,7 +1173,7 @@ class Job:
+             self.held_probs = SeqTensor((1, 0), dtype = torch.float, seq_dim = -1)
+             self.held_logits = SeqTensor((1, 0, self.generator.padded_vocab_size), dtype = torch.float, seq_dim = 1)
+             self.full_completion = ""
+-            self.sam = None if not generator.ngram_match_min else ext.BC_SAM()
++            self.sam = None if not (generator.ngram_match_min or generator.hybrid_ngram) else ext.BC_SAM()
+ 
+         self.time_enqueue = time.time()
+ 
+@@ -1647,16 +1647,33 @@ class Job:
+         """
+         Return speculative draft tokens from the suffix-array n-gram matcher.
+         """
++        draft, _ = self.probe_ngram_draft(draft_length, self.generator.ngram_match_min)
++        return draft
++
++
++    def probe_ngram_draft(self, draft_length: int, min_match: int):
++        """
++        Hybrid-mode ngram probe (EXL3_HYBRID_NGRAM): update the SAM with the job's new
++        history and return ((1, w) continuation draft, match_len). The draft is empty
++        when the longest suffix repeat is shorter than min_match; its length is whatever
++        continuation remains after the match, capped at draft_length.
++
++        accept_tensor consumes history incrementally — it tracks its own offset into the
++        sequence and rebuilds the automaton when a rewind shrinks it — so intermittent
++        probing (ngram this round, MTP the next) is exact: each call consumes whatever
++        tokens arrived since the previous one and matches against the full prefix.
++        """
+         assert self.sam
+ 
+         # Update SAM with current history and find longest suffix
+         seq = self.sequences[0].sequence_ids.torch()
+         beg, end = self.sam.accept_tensor(seq)
++        match_len = end - beg
+ 
+         # Grab continuation after longest match or return empty seq
+-        if end - beg >= self.generator.ngram_match_min:
++        if match_len >= min_match:
+             draft = seq[:, end : end + draft_length]
+         else:
+             draft = torch.empty((1, 0), dtype = torch.long)
+ 
+-        return draft
++        return draft, match_len
+diff --git a/exllamav3/generator/spec_sampling.py b/exllamav3/generator/spec_sampling.py
+new file mode 100644
+index 0000000..e8f1898
+--- /dev/null
++++ b/exllamav3/generator/spec_sampling.py
+@@ -0,0 +1,339 @@
++from __future__ import annotations
++import math
++import os as _os
++import torch
++from dataclasses import dataclass
++from .sampler.custom import (
++    SS_RepP,
++    SS_Fused,
++    SS_Temperature,
++    SS_TopK,
++    SS_TopP,
++    SS_Sample,
++    SS_Normalize,
++    SS_Sort,
++)
++
++"""
++Exact speculative sampling (design: docs/spec_sampling.md) — pure, generator-state-free
++helpers. M1 uses them for shadow-mode measurement (EXL3_SPEC_SHADOW=1); M2 uses them for
++the real spec path (EXL3_SPEC_SAMPLING=1): drafts sampled from the shaped q, per-position
++acceptance min(1, p/q) and rejection resampling from renorm((p - q)+), all in log space.
++
++spec_transform() mirrors the executed sampler stack
++
++    [SS_RepP?, SS_Fused(MODE_SAMPLE | MODE_SAMPLE_FILTERS)]
++
++(or the equivalent discrete tail when EXL3_FUSED_SAMPLER=0) as a standalone
++logits -> log-probs transform over the full vocabulary. Known negligible differences vs.
++the fused CUDA kernel:
++
++- top_k truncates exactly K tokens in sort order; the fused kernel keeps every token tied
++  exactly at the cutoff
++- rep-penalty factors reduce with torch scatter_reduce("amax") instead of the kernel's
++  shared-memory atomicMax
++"""
++
++# Draft distribution shaping (M1 shadow winner on live traffic: q_shaped edged out
++# q_t0.6/q_t0.8/q_t1.0). Exactness holds for any q; these only affect acceptance rate.
++SPEC_Q_TEMP = float(_os.environ.get("EXL3_SPEC_Q_TEMP", "0.6"))
++SPEC_Q_TOP_K = 20
++SPEC_Q_TOP_P = 0.95
++
++
++@dataclass
++class SpecTransform:
++    """
++    Supported-subset sampler parameters extracted from a CustomSampler's executed stack.
++    """
++    temperature: float = 1.0
++    top_k: int = 0
++    top_p: float = 1.0
++    temp_first: bool = True
++    rep_p: float = 1.0
++    sustain_range: int = 0
++    decay_range: int = 0
++
++
++def extract_spec(sampler) -> SpecTransform | None:
++    """
++    Extract the shadow/spec transform from a CustomSampler's executed stack. Returns None
++    when the stack is outside the supported subset (min_p, greedy, DRY/XTC/pres-freq
++    penalties, bans, logit bias, extra steps, ...); the caller falls back to legacy-only
++    behavior for that job.
++    """
++    steps = getattr(sampler, "steps", None)
++    if not steps:
++        return None
++    tail = list(steps)
++    spec = SpecTransform()
++
++    # Head: at most one repetition-penalty step
++    if type(tail[0]) is SS_RepP:
++        rep = tail.pop(0)
++        spec.rep_p = rep.rep_p
++        spec.sustain_range = rep.sustain_range
++        spec.decay_range = rep.decay_range
++    if not tail:
++        return None
++
++    # Fused tail (default, EXL3_FUSED_SAMPLER=1)
++    if len(tail) == 1 and type(tail[0]) is SS_Fused:
++        f = tail[0]
++        if f.mode == SS_Fused.MODE_SAMPLE:
++            spec.temperature = 1.0 / f.inv_temp
++            return spec
++        if f.mode == SS_Fused.MODE_SAMPLE_FILTERS:
++            spec.temperature = 1.0 / f.inv_temp
++            spec.top_k = f.top_k
++            spec.top_p = f.top_p
++            # SS_Fused weighs the filter histogram with the sampling temperature iff
++            # temperature preceded the filters in the original stack
++            spec.temp_first = math.isclose(f.inv_temp_filter, f.inv_temp)
++            return spec
++        # MODE_GREEDY (degenerate, spec gain is zero) and MODE_SAMPLE_MINP (min_p is
++        # outside the v1 subset) fall back to legacy
++        return None
++
++    # Discrete tail (EXL3_FUSED_SAMPLER=0, testing/validation): SS_Normalize / SS_Sort are
++    # inserted prep steps that do not change the transform math
++    rest = [s for s in tail if type(s) not in (SS_Normalize, SS_Sort)]
++    if not rest or not isinstance(rest[-1], SS_Sample):
++        return None
++    pre = rest[:-1]
++
++    # At most one temperature step, leading or trailing the filter sequence
++    temp_first = False
++    temperature = 1.0
++    if pre and type(pre[0]) is SS_Temperature:
++        temp_first = True
++        temperature = pre[0].temperature
++        pre = pre[1:]
++    if pre and type(pre[-1]) is SS_Temperature:
++        if temp_first:
++            return None
++        temperature = pre[-1].temperature
++        pre = pre[:-1]
++
++    # Filters must be a subsequence of (TopK, TopP); min_p and everything else -> legacy
++    order = (SS_TopK, SS_TopP)
++    pos = -1
++    for s in pre:
++        t = type(s)
++        if t not in order or order.index(t) <= pos:
++            return None
++        pos = order.index(t)
++
++    spec.temperature = temperature
++    spec.temp_first = temp_first
++    spec.top_k = next((s.top_k for s in pre if type(s) is SS_TopK), 0)
++    spec.top_p = next((s.top_p for s in pre if type(s) is SS_TopP), 1.0)
++    return spec
++
++
++def _apply_rep_penalty(logits: torch.Tensor, past_ids: torch.Tensor, spec: SpecTransform) -> torch.Tensor:
++    """
++    Torch mirror of ext.apply_rep_pens: per-token penalty factor (max over occurrences,
++    linearly decayed between sustain_range and sustain_range + decay_range), positive
++    logits divided by rep_p, negative ones multiplied, interpolated by the factor.
++    """
++    past = past_ids.view(-1)
++    past_len = past.numel()
++    sustain = spec.sustain_range
++    decay = spec.decay_range
++    vocab = logits.shape[-1]
++    factors = torch.zeros(vocab, dtype = torch.float32, device = logits.device)
++    lo = past_len - sustain - decay
++    # Kernel skips i <= past_len - sustain_range - decay_range
++    if past_len and lo < past_len - 1:
++        pos = torch.arange(past_len, device = past.device)
++        act = pos > lo
++        ids = past[act]
++        dist = (past_len - pos[act]).to(torch.float32)
++        if decay > 0:
++            f = (1.0 - (dist - sustain) / decay).clamp_(0.0, 1.0)
++        else:
++            f = torch.ones_like(dist)
++        f = torch.where(dist <= sustain, torch.ones_like(dist), f)
++        valid = (ids >= 0) & (ids < vocab)
++        factors.scatter_reduce_(0, ids[valid], f[valid], "amax", include_self = True)
++    f = factors + 1e-30
++    f1 = (1.0 - f) + 1e-30
++    w = torch.where(logits > 0.0, logits / spec.rep_p, logits * spec.rep_p)
++    return logits * f1 + w * f
++
++
++def _truncate(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
++    """
++    Torch mirror of the discrete SS_TopK -> SS_Normalize -> SS_TopP sequence (same order
++    and threshold semantics as the fused kernel's histogram select): top_k keeps exactly
++    the K highest logits; top_p then normalizes over the kept set and keeps sorted
++    positions while the cumulative probability stays <= top_p (position 0 always kept).
++    Works on (..., vocab) — 1D rows and batched row stacks alike.
++    """
++    vocab = logits.shape[-1]
++    if 0 < top_k < vocab:
++        s_logits, s_idx = torch.sort(logits, dim = -1, descending = True)
++        kept = torch.full_like(s_logits, -float("inf"))
++        kept[..., :top_k] = s_logits[..., :top_k]
++        logits = torch.full_like(logits, -float("inf")).scatter(-1, s_idx, kept)
++    if 0.0 < top_p < 1.0:
++        s_logits, s_idx = torch.sort(logits, dim = -1, descending = True)
++        probs = torch.softmax(s_logits, dim = -1)
++        keep = probs.cumsum(dim = -1) <= top_p
++        keep[..., 0] = True
++        s_logits = torch.where(keep, s_logits, torch.full_like(s_logits, -float("inf")))
++        logits = torch.full_like(logits, -float("inf")).scatter(-1, s_idx, s_logits)
++    return logits
++
++
++def spec_transform(
++    logits_row: torch.Tensor,
++    past_ids: torch.Tensor | None,
++    spec: SpecTransform,
++) -> torch.Tensor:
++    """
++    Target-side post-transform distribution p for one verification position, as fp32
++    log-probs over the full vocabulary. Mirrors the job sampler's executed stack:
++    rep penalty (over past_ids) -> [temperature] -> top_k -> top_p -> [temperature] ->
++    log_softmax, with temperature applied before the filters iff temp_first.
++    """
++    logits = logits_row.float().clone()
++    if spec.rep_p != 1.0 and past_ids is not None and past_ids.numel():
++        logits = _apply_rep_penalty(logits, past_ids.to(logits.device), spec)
++    if spec.temp_first and spec.temperature != 1.0:
++        logits = logits / spec.temperature
++    logits = _truncate(logits, spec.top_k, spec.top_p)
++    if not spec.temp_first and spec.temperature != 1.0:
++        logits = logits / spec.temperature
++    return torch.log_softmax(logits, dim = -1)
++
++
++def spec_transform_batched(
++    logits_rows: torch.Tensor,
++    pasts: list,
++    spec: SpecTransform,
++) -> torch.Tensor:
++    """
++    Batched spec_transform: (w, vocab) logits rows -> (w, vocab) fp32 log-probs. pasts[i]
++    is the past-ids row for position i (None disables the penalty for that row). The
++    rep penalty is applied per row (its factors depend on each row's own past length);
++    temperature and the top_k/top_p truncation batch over rows. Launch-only, no syncs —
++    the spec verify path builds all rows optimistically and reads back once per window.
++    """
++    logits = logits_rows.float()
++    if spec.rep_p != 1.0:
++        dev = logits.device
++        logits = torch.stack([
++            _apply_rep_penalty(logits[i], p.to(dev), spec)
++            if p is not None and p.numel() else logits[i]
++            for i, p in enumerate(pasts)
++        ])
++    if spec.temp_first and spec.temperature != 1.0:
++        logits = logits / spec.temperature
++    logits = _truncate(logits, spec.top_k, spec.top_p)
++    if not spec.temp_first and spec.temperature != 1.0:
++        logits = logits / spec.temperature
++    return torch.log_softmax(logits, dim = -1)
++
++
++def shape_q_logprobs(
++    logq: torch.Tensor,
++    temperature: float = 0.6,
++    top_k: int = 20,
++    top_p: float = 0.95,
++) -> torch.Tensor:
++    """
++    q shaping (design §8.4): rescale the draft head's log-probs by temperature and apply
++    q's OWN top_k/top_p truncation (its own statistics only, no peek at p). Exact
++    speculative sampling is unbiased for any q, so this costs nothing in correctness.
++    """
++    logits = logq / temperature
++    logits = _truncate(logits, top_k, top_p)
++    return torch.log_softmax(logits, dim = -1)
++
++
++def shadow_overlaps(logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
++    """
++    Expected per-position acceptance E[sum_x min(p(x), q(x))] for the four q variants:
++    raw (T=1.0), T=0.8, T=0.6, and T=0.6 + q-shaped top_k=20/top_p=0.95. q lives on the
++    pruned-head slice (first n2 columns) and is zero outside it, so the sum only needs
++    the slice; p is restricted to the same columns. Returns a (4,) fp32 tensor.
++    """
++    n2 = logq.shape[-1]
++    p = logp[:n2].exp()
++    ovs = []
++    for t in (1.0, 0.8, 0.6):
++        lq = logq if t == 1.0 else torch.log_softmax(logq / t, dim = -1)
++        ovs.append(torch.minimum(p, lq.exp()).sum())
++    lq = shape_q_logprobs(logq, 0.6, 20, 0.95)
++    ovs.append(torch.minimum(p, lq.exp()).sum())
++    return torch.stack(ovs)
++
++
++def job_spec(job) -> SpecTransform | None:
++    """
++    M2 spec-path eligibility for one job (design §4): the job's sampler stack must be in
++    the supported subset AND nothing may make the per-position distribution depend on
++    state the spec path does not model (filters, forced tokens, logit masks, prob
++    exports, multi-sequence/CFG, token healing). Returns the transform, or None to keep
++    the job on the legacy match-verify path.
++    """
++    if (
++        len(job.sequences) != 1 or
++        job.filters or
++        job.forced_ids is not None or
++        job.return_probs or
++        job.return_top_tokens > 0 or
++        job.device_logit_mask is not None or
++        job.new_tokens < 0
++    ):
++        return None
++    return extract_spec(job.sampler)
++
++
++def shaped_q(logq: torch.Tensor) -> torch.Tensor:
++    """
++    The actual draft distribution q used by the spec path (M1-measured shaping: temp 0.6
++    + the draft head's own top_k=20/top_p=0.95 truncation). Drafting samples from this
++    and verification must test against exactly the same q.
++    """
++    return shape_q_logprobs(logq, SPEC_Q_TEMP, SPEC_Q_TOP_K, SPEC_Q_TOP_P)
++
++
++def q_sample(logq_row: torch.Tensor, seed: int) -> torch.Tensor:
++    """
++    Draw one draft token from the shaped q (deterministic given the seed; the caller
++    seeds from job.rng so runs stay reproducible per job seed).
++    """
++    probs = shaped_q(logq_row).exp()
++    gen = torch.Generator(device = logq_row.device)
++    gen.manual_seed(seed)
++    return torch.multinomial(probs, 1, generator = gen)
++
++
++def spec_accept(logu: float, logpd: float, logqd: float) -> bool:
++    """
++    Acceptance test in log space (design §8: avoids overflow for tiny q(d)): accept the
++    draft iff log u < min(0, logp(d) - logq(d)). q(d) == 0 (draft outside the pruned-head
++    slice) is passed as logqd = -inf and always accepts; p(d) == 0 gives logpd = -inf and
++    always rejects.
++    """
++    return logu < min(0.0, logpd - logqd)
++
++
++def spec_residual_probs(logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
++    """
++    Rejection resampling distribution renorm((p - q)+) over the full vocabulary. q is
++    zero outside the pruned-head slice, so the residual there equals p without
++    materializing q beyond the slice. Falls back to p in the fp-degenerate p == q case
++    (unreachable via rejection in exact math, since acceptance is then 1).
++    """
++    n2 = logq.shape[-1]
++    p = logp.exp()
++    r = p.clone()
++    r[:n2] = (p[:n2] - logq.exp()).clamp_(min = 0.0)
++    s = r.sum()
++    if s <= 0.0:
++        return p
++    return r / s
+diff --git a/scratch/.gitignore b/scratch/.gitignore
+new file mode 100644
+index 0000000..55f9526
+--- /dev/null
++++ b/scratch/.gitignore
+@@ -0,0 +1,3 @@
++*.trace.json
++*.nsys-rep
++*.sqlite
+diff --git a/scratch/m4.ctx500.keyavg.txt b/scratch/m4.ctx500.keyavg.txt
+new file mode 100644
+index 0000000..99a1e5c
+--- /dev/null
++++ b/scratch/m4.ctx500.keyavg.txt
+@@ -0,0 +1,46 @@
++-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
++                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
++-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
++void exl3_moe_coop_ns::exl3_moe_coop_a_kernel<3, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us     222.583ms        17.71%     222.583ms      94.716us          2350  
++void exl3_mgemm_kernel<4, false, true, 2, 16, 16, 51...         0.00%       0.000us         0.00%       0.000us       0.000us     178.252ms        14.19%     178.252ms     104.854us          1700  
++void exl3_moe_coop_ns::exl3_moe_coop_b_kernel<3, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us     105.665ms         8.41%     105.665ms      44.964us          2350  
++void gr_finalize_i8_kernel<4, true>(float const*, fl...         0.00%       0.000us         0.00%       0.000us       0.000us      98.347ms         7.83%      98.347ms      20.278us          4850  
++void gr_dots_i8_kernel<4>(float const*, signed char ...         0.00%       0.000us         0.00%       0.000us       0.000us      87.143ms         6.93%      87.143ms      17.968us          4850  
++void exl3_gemm_kernel<5, false, false, 2, 16, 32, 25...         0.00%       0.000us         0.00%       0.000us       0.000us      86.563ms         6.89%      86.563ms       1.731ms            50  
++void exl3_moe_coop_ns::exl3_moe_coop_a_kernel<4, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us      85.047ms         6.77%      85.047ms      35.436us          2400  
++void exl3_gemm_kernel<4, false, true, 2, 16, 32, 256...         0.00%       0.000us         0.00%       0.000us       0.000us      76.832ms         6.11%      76.832ms      45.195us          1700  
++void exl3_mgemm_kernel<5, false, false, 2, 16, 16, 5...         0.00%       0.000us         0.00%       0.000us       0.000us      71.144ms         5.66%      71.144ms     118.573us           600  
++void exl3_gemm_kernel<5, false, true, 2, 16, 32, 128...         0.00%       0.000us         0.00%       0.000us       0.000us      36.575ms         2.91%      36.575ms      52.250us           700  
++routing_gemv_kernel(__half const*, __half const*, __...         0.00%       0.000us         0.00%       0.000us       0.000us      35.178ms         2.80%      35.178ms      14.657us          2400  
++void cuda_recurrent_gated_delta_rule_kernel_128<fals...         0.00%       0.000us         0.00%       0.000us       0.000us      34.582ms         2.75%      34.582ms      19.212us          1800  
++void exl3_moe_coop_ns::exl3_moe_coop_b_kernel<4, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us      31.534ms         2.51%      31.534ms      13.419us          2350  
++                                               aten::mm         0.14%       1.661ms         0.31%       3.535ms      35.352us      16.063ms         1.28%      16.129ms     161.287us           100  
++std::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us      12.907ms         1.03%      12.907ms     258.138us            50  
++void exl3_mgemm_kernel<5, false, true, 2, 16, 16, 51...         0.00%       0.000us         0.00%       0.000us       0.000us      12.881ms         1.03%      12.881ms     128.809us           100  
++gdn_ba_gemv_kernel(__half const*, __half const*, __h...         0.00%       0.000us         0.00%       0.000us       0.000us       9.962ms         0.79%       9.962ms       5.534us          1800  
++void exl3_gemm_kernel<5, false, false, 2, 16, 32, 12...         0.00%       0.000us         0.00%       0.000us       0.000us       9.491ms         0.76%       9.491ms      15.819us           600  
++void conv1d_update_kernel<true, false>(__nv_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us       9.484ms         0.75%       9.484ms       5.269us          1800  
++                        _paged_attn_decode_split_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       9.448ms         0.75%       9.448ms      15.747us           600  
++routing_std_topk_kernel(__half const*, long*, __half...         0.00%       0.000us         0.00%       0.000us       0.000us       9.357ms         0.74%       9.357ms       3.899us          2400  
++void hc_apply_kernel<4, float, false>(float*, float ...         0.00%       0.000us         0.00%       0.000us       0.000us       7.507ms         0.60%       7.507ms       1.564us          4800  
++void gated_delta_net_fused_op_3_kernel<__nv_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us       3.876ms         0.31%       3.876ms       2.153us          1800  
++std::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us       3.156ms         0.25%       3.156ms      63.120us            50  
++void gated_rms_norm_kernel<32, __half, __nv_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us       2.933ms         0.23%       2.933ms       1.629us          1800  
++                      _paged_attn_decode_combine_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       2.417ms         0.19%       2.417ms       4.028us           600  
++void rope_kernel<2, true>(__half const*, __half*, __...         0.00%       0.000us         0.00%       0.000us       0.000us       2.304ms         0.18%       2.304ms       3.840us           600  
++                                    cudaPeekAtLastError         0.07%     764.872us         0.07%     764.872us       0.035us       1.992ms         0.16%       1.992ms       0.090us         22050  
++                                _qsa_pool_update_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       1.879ms         0.15%       1.879ms       3.131us           600  
++                                       cudaLaunchKernel         8.41%      97.221ms         8.57%      99.028ms       3.312us       1.757ms         0.14%       1.757ms       0.059us         29900  
++void exl3_moe_coop_ns::exl3_moe_coop_a_kernel<5, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us       1.716ms         0.14%       1.716ms      34.325us            50  
++void exl3_moe_coop_ns::exl3_moe_coop_b_kernel<5, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us       1.430ms         0.11%       1.430ms      14.296us           100  
++                                _paged_kv_update_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       1.006ms         0.08%       1.006ms       1.677us           600  
++                               _mla_plane_update_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     974.786us         0.08%     974.786us       1.625us           600  
++                                      _qsa_stage_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     778.193us         0.06%     778.193us       1.297us           600  
++deinterleave_qg_kernel(uint4 const*, uint4*, uint4*,...         0.00%       0.000us         0.00%       0.000us       0.000us     697.778us         0.06%     697.778us       1.163us           600  
++                                            aten::copy_         0.21%       2.436ms         0.56%       6.464ms       6.464us     608.202us         0.05%     608.202us       0.608us          1000  
++mul_sigmoid_kernel_h(__half*, __half const*, unsigne...         0.00%       0.000us         0.00%       0.000us       0.000us     523.410us         0.04%     523.410us       0.872us           600  
++                                     aten::index_select         0.10%       1.140ms         0.15%       1.692ms      16.915us     332.403us         0.03%     332.403us       3.324us           100  
++void at::native::(anonymous namespace)::indexSelectS...         0.00%       0.000us         0.00%       0.000us       0.000us     332.403us         0.03%     332.403us       6.648us            50  
++-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
++Self CPU time total: 1.156s
++Self CUDA time total: 1.257s
+diff --git a/scratch/m4.ctx500.wall.json b/scratch/m4.ctx500.wall.json
+new file mode 100644
+index 0000000..5f976bd
+--- /dev/null
++++ b/scratch/m4.ctx500.wall.json
+@@ -0,0 +1,64 @@
++{
++ "ctx_target": 500,
++ "prompt_tokens": 366,
++ "prefill_s": 2.778,
++ "prefill_tok_s": 131.7,
++ "steps": 50,
++ "wall_mean_ms": 27.895,
++ "wall_p50_ms": 27.544,
++ "wall_min_ms": 26.68,
++ "wall_max_ms": 30.677,
++ "wall_total_s_prof_region": 2.07,
++ "walls_ms": [
++  30.677,
++  29.223,
++  29.411,
++  28.931,
++  29.059,
++  26.827,
++  27.551,
++  28.164,
++  28.578,
++  29.266,
++  29.218,
++  30.142,
++  29.212,
++  29.433,
++  28.707,
++  30.383,
++  30.036,
++  29.531,
++  29.158,
++  29.139,
++  28.948,
++  28.261,
++  26.804,
++  26.751,
++  27.544,
++  26.72,
++  26.708,
++  26.709,
++  26.706,
++  26.742,
++  28.751,
++  28.198,
++  26.798,
++  26.701,
++  26.721,
++  26.736,
++  26.741,
++  26.708,
++  26.76,
++  26.703,
++  26.725,
++  26.749,
++  26.739,
++  26.68,
++  27.58,
++  27.442,
++  26.972,
++  26.869,
++  26.713,
++  26.908
++ ]
++}
+\ No newline at end of file
+diff --git a/scratch/m4.ctx8000.keyavg.txt b/scratch/m4.ctx8000.keyavg.txt
+new file mode 100644
+index 0000000..2edeadd
+--- /dev/null
++++ b/scratch/m4.ctx8000.keyavg.txt
+@@ -0,0 +1,46 @@
++-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
++                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
++-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
++void exl3_moe_coop_ns::exl3_moe_coop_a_kernel<3, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us     222.147ms        17.53%     222.147ms      94.530us          2350  
++void exl3_mgemm_kernel<4, false, true, 2, 16, 16, 51...         0.00%       0.000us         0.00%       0.000us       0.000us     177.776ms        14.03%     177.776ms     104.574us          1700  
++void exl3_moe_coop_ns::exl3_moe_coop_b_kernel<3, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us     105.822ms         8.35%     105.822ms      45.031us          2350  
++void gr_finalize_i8_kernel<4, true>(float const*, fl...         0.00%       0.000us         0.00%       0.000us       0.000us      98.516ms         7.77%      98.516ms      20.313us          4850  
++void gr_dots_i8_kernel<4>(float const*, signed char ...         0.00%       0.000us         0.00%       0.000us       0.000us      86.753ms         6.84%      86.753ms      17.887us          4850  
++void exl3_gemm_kernel<5, false, false, 2, 16, 32, 25...         0.00%       0.000us         0.00%       0.000us       0.000us      85.452ms         6.74%      85.452ms       1.709ms            50  
++void exl3_moe_coop_ns::exl3_moe_coop_a_kernel<4, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us      84.627ms         6.68%      84.627ms      35.261us          2400  
++void exl3_gemm_kernel<4, false, true, 2, 16, 32, 256...         0.00%       0.000us         0.00%       0.000us       0.000us      76.259ms         6.02%      76.259ms      44.858us          1700  
++void exl3_mgemm_kernel<5, false, false, 2, 16, 16, 5...         0.00%       0.000us         0.00%       0.000us       0.000us      71.232ms         5.62%      71.232ms     118.720us           600  
++void exl3_gemm_kernel<5, false, true, 2, 16, 32, 128...         0.00%       0.000us         0.00%       0.000us       0.000us      36.390ms         2.87%      36.390ms      51.986us           700  
++routing_gemv_kernel(__half const*, __half const*, __...         0.00%       0.000us         0.00%       0.000us       0.000us      34.714ms         2.74%      34.714ms      14.464us          2400  
++void cuda_recurrent_gated_delta_rule_kernel_128<fals...         0.00%       0.000us         0.00%       0.000us       0.000us      34.320ms         2.71%      34.320ms      19.067us          1800  
++void exl3_moe_coop_ns::exl3_moe_coop_b_kernel<4, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us      31.466ms         2.48%      31.466ms      13.390us          2350  
++                               _qsa_sparse_split_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      17.976ms         1.42%      17.976ms      29.960us           600  
++                                               aten::mm         0.13%       1.506ms         0.17%       1.976ms      19.756us      15.683ms         1.24%      15.683ms     156.825us           100  
++void exl3_mgemm_kernel<5, false, true, 2, 16, 16, 51...         0.00%       0.000us         0.00%       0.000us       0.000us      12.748ms         1.01%      12.748ms     127.481us           100  
++std::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us      12.617ms         1.00%      12.617ms     252.338us            50  
++gdn_ba_gemv_kernel(__half const*, __half const*, __h...         0.00%       0.000us         0.00%       0.000us       0.000us       9.769ms         0.77%       9.769ms       5.427us          1800  
++routing_std_topk_kernel(__half const*, long*, __half...         0.00%       0.000us         0.00%       0.000us       0.000us       9.438ms         0.74%       9.438ms       3.933us          2400  
++void exl3_gemm_kernel<5, false, false, 2, 16, 32, 12...         0.00%       0.000us         0.00%       0.000us       0.000us       9.416ms         0.74%       9.416ms      15.693us           600  
++void conv1d_update_kernel<true, false>(__nv_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us       9.068ms         0.72%       9.068ms       5.038us          1800  
++void hc_apply_kernel<4, float, false>(float*, float ...         0.00%       0.000us         0.00%       0.000us       0.000us       7.429ms         0.59%       7.429ms       1.548us          4800  
++void gated_delta_net_fused_op_3_kernel<__nv_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us       3.835ms         0.30%       3.835ms       2.131us          1800  
++void dsa_topk_kernel<true>(__half const*, int*, int,...         0.00%       0.000us         0.00%       0.000us       0.000us       3.222ms         0.25%       3.222ms       5.369us           600  
++std::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us       3.066ms         0.24%       3.066ms      61.313us            50  
++void gated_rms_norm_kernel<32, __half, __nv_bfloat16...         0.00%       0.000us         0.00%       0.000us       0.000us       2.916ms         0.23%       2.916ms       1.620us          1800  
++                      _paged_attn_decode_combine_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       2.406ms         0.19%       2.406ms       4.010us           600  
++void rope_kernel<2, true>(__half const*, __half*, __...         0.00%       0.000us         0.00%       0.000us       0.000us       2.314ms         0.18%       2.314ms       3.856us           600  
++                               _dsa_indexer_fewq_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       2.072ms         0.16%       2.072ms       3.454us           600  
++                                       cudaLaunchKernel         8.24%      96.357ms         8.56%     100.087ms       3.347us       2.025ms         0.16%       2.025ms       0.068us         29900  
++                                _qsa_pool_update_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       1.879ms         0.15%       1.879ms       3.132us           600  
++void exl3_moe_coop_ns::exl3_moe_coop_a_kernel<5, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us       1.630ms         0.13%       1.630ms      32.607us            50  
++void exl3_moe_coop_ns::exl3_moe_coop_b_kernel<5, 2, ...         0.00%       0.000us         0.00%       0.000us       0.000us       1.439ms         0.11%       1.439ms      14.387us           100  
++                                    cudaPeekAtLastError         0.06%     704.374us         0.06%     704.374us       0.032us       1.377ms         0.11%       1.377ms       0.062us         22050  
++                                _paged_kv_update_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       1.336ms         0.11%       1.336ms       2.226us           600  
++void rope_kernel<2, false>(__half const*, __half*, _...         0.00%       0.000us         0.00%       0.000us       0.000us       1.157ms         0.09%       1.157ms       1.928us           600  
++                               _mla_plane_update_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     995.407us         0.08%     995.407us       1.659us           600  
++                                _dsa_pool_expand_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     931.982us         0.07%     931.982us       1.553us           600  
++                                      _qsa_stage_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     778.096us         0.06%     778.096us       1.297us           600  
++deinterleave_qg_kernel(uint4 const*, uint4*, uint4*,...         0.00%       0.000us         0.00%       0.000us       0.000us     695.153us         0.05%     695.153us       1.159us           600  
++-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
++Self CPU time total: 1.169s
++Self CUDA time total: 1.268s
+diff --git a/scratch/m4.ctx8000.wall.json b/scratch/m4.ctx8000.wall.json
+new file mode 100644
+index 0000000..c2e0608
+--- /dev/null
++++ b/scratch/m4.ctx8000.wall.json
+@@ -0,0 +1,64 @@
++{
++ "ctx_target": 8000,
++ "prompt_tokens": 5943,
++ "prefill_s": 10.026,
++ "prefill_tok_s": 592.7,
++ "steps": 50,
++ "wall_mean_ms": 27.745,
++ "wall_p50_ms": 27.071,
++ "wall_min_ms": 26.941,
++ "wall_max_ms": 37.637,
++ "wall_total_s_prof_region": 2.039,
++ "walls_ms": [
++  31.659,
++  29.346,
++  29.439,
++  29.589,
++  27.117,
++  28.214,
++  29.293,
++  29.677,
++  27.114,
++  27.044,
++  27.125,
++  27.026,
++  27.039,
++  26.984,
++  27.162,
++  27.98,
++  27.012,
++  27.828,
++  27.029,
++  27.06,
++  27.1,
++  27.062,
++  27.046,
++  27.039,
++  27.071,
++  27.076,
++  27.019,
++  27.051,
++  27.214,
++  27.105,
++  27.083,
++  27.003,
++  27.045,
++  27.008,
++  26.969,
++  27.052,
++  27.02,
++  27.027,
++  26.996,
++  26.984,
++  27.026,
++  26.941,
++  27.001,
++  27.113,
++  27.223,
++  27.15,
++  27.067,
++  37.637,
++  28.767,
++  29.598
++ ]
++}
+\ No newline at end of file
+diff --git a/scratch/m4_aggregate.py b/scratch/m4_aggregate.py
+new file mode 100644
+index 0000000..7f71613
+--- /dev/null
++++ b/scratch/m4_aggregate.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++"""Aggregate a chrome trace: GPU busy/span/gap, kernel count, launches, buckets, top kernels."""
++import json, sys, re, collections
++
++path, steps = sys.argv[1], int(sys.argv[2])
++ev = json.load(open(path))
++ev = ev["traceEvents"] if isinstance(ev, dict) else ev
++
++kernels = [e for e in ev if e.get("cat") == "kernel"]
++memcpy = [e for e in ev if e.get("cat") in ("gpu_memcpy", "gpu_memset")]
++launches = [e for e in ev if e.get("cat") == "cuda_runtime" and "LaunchKernel" in e.get("name", "")]
++
++busy = sum(e["dur"] for e in kernels) + sum(e["dur"] for e in memcpy)
++gpu_ev = kernels + memcpy
++span = max(e["ts"] + e["dur"] for e in gpu_ev) - min(e["ts"] for e in gpu_ev)
++print(f"kernels: {len(kernels)} total, {len(kernels)/steps:.0f}/step; "
++      f"memcpy/memset: {len(memcpy)} ({sum(e['dur'] for e in memcpy)/1000:.2f}ms)")
++print(f"cudaLaunchKernel: {len(launches)} total, {len(launches)/steps:.0f}/step, "
++      f"CPU time {sum(e['dur'] for e in launches)/1000:.1f}ms ({sum(e['dur'] for e in launches)/1000/steps:.2f}ms/step)")
++print(f"GPU busy {busy/1000:.1f}ms over span {span/1000:.1f}ms -> per step busy {busy/1000/steps:.2f}ms, "
++      f"idle-in-span {(span-busy)/1000/steps:.2f}ms/step, occupancy {busy/span*100:.1f}%")
++
++BUCKETS = [
++    ("MoE GEMM+routing", r"exl3_moe_coop|exl3_mgemm|routing_"),
++    ("dense GEMM (attn proj/lm_head/dense)", r"exl3_gemm|gemvx|aten::mm|deinterleave|cublas|sm1\d+_xmma|nvjet"),
++    ("GDN (gated delta net)", r"gated_delta|gdn_|conv1d_update|causal_conv"),
++    ("attention (QSA/paged)", r"attn|_qsa_|_paged_kv|_mla_|flash|fa_"),
++    ("hyperconnection/gr mixers", r"gr_finalize|gr_dots|hc_apply"),
++    ("norm/elementwise/rope", r"rms|norm|rope|silu|elementwise|mul_sigmoid|sigmoid|vectorized|copy|cat_|index"),
++    ("sampler", r"sample|argmax|topk|softmax|sort"),
++]
++agg = collections.defaultdict(lambda: [0, 0.0])
++names = collections.defaultdict(lambda: [0, 0.0])
++for e in kernels:
++    n = e["name"]
++    names[n][0] += 1; names[n][1] += e["dur"]
++    for label, pat in BUCKETS:
++        if re.search(pat, n, re.I):
++            agg[label][0] += 1; agg[label][1] += e["dur"]; break
++    else:
++        agg["other"][0] += 1; agg["other"][1] += e["dur"]
++
++print(f"\n{'bucket':42s} {'ms/step':>8s} {'%busy':>6s} {'k/step':>7s}")
++for label, (c, d) in sorted(agg.items(), key=lambda kv: -kv[1][1]):
++    print(f"{label:42s} {d/1000/steps:8.2f} {d/busy*100:5.1f}% {c/steps:7.1f}")
++
++print(f"\ntop 20 kernels by total time:")
++print(f"{'name':70s} {'ms/step':>8s} {'%busy':>6s} {'n/step':>7s} {'us avg':>7s}")
++for n, (c, d) in sorted(names.items(), key=lambda kv: -kv[1][1])[:20]:
++    print(f"{n[:70]:70s} {d/1000/steps:8.2f} {d/busy*100:5.1f}% {c/steps:7.1f} {d/c:7.1f}")
+diff --git a/scratch/m4_gr_bench.py b/scratch/m4_gr_bench.py
+new file mode 100644
+index 0000000..2c777cb
+--- /dev/null
++++ b/scratch/m4_gr_bench.py
+@@ -0,0 +1,41 @@
++import time, torch
++from exllamav3.ext import exllamav3_ext as ext
++
++dev = "cuda"
++H, D, LR = 4, 2560, 320
++M = LR + H
++torch.manual_seed(0)
++
++streams = torch.randn(1, H, D, dtype=torch.float, device=dev)
++fn_q = torch.randint(-128, 127, (M, H*D), dtype=torch.int8, device=dev)
++fn_s = torch.rand(M, dtype=torch.float, device=dev)
++up_q = torch.randint(-128, 127, (H, D//4, LR, 4), dtype=torch.int8, device=dev)
++up_s = torch.rand(H, D, dtype=torch.float, device=dev)
++w = torch.randn(H*D, dtype=torch.half, device=dev)
++dots = torch.empty(1, M+1, H, dtype=torch.float, device=dev)
++post = torch.empty(1, H, dtype=torch.float, device=dev)
++mixed = torch.empty(1, D, dtype=torch.half, device=dev)
++
++def timeit(fn, iters=2000, label=""):
++    for _ in range(20): fn()
++    torch.cuda.synchronize()
++    t0 = time.perf_counter()
++    for _ in range(iters): fn()
++    torch.cuda.synchronize()
++    us = (time.perf_counter()-t0)/iters*1e6
++    print(f"{label:40s} {us:7.2f} us")
++    return us
++
++bytes_pair = fn_q.numel() + up_q.numel() + streams.numel()*4*2  # tables + streams r/w approx
++t = timeit(lambda: ext.gr_mix_int8(streams, fn_q, fn_s, up_q, up_s, w, 1e-6, dots, post, mixed), label="gr_mix_int8 pair R=1 (one site)")
++print(f"  -> per-site {t:.1f}us, tables {bytes_pair/1e6:.2f}MB, eff BW {bytes_pair/t/1e3:.0f} GB/s; x97 sites = {97*t/1000:.2f} ms/step")
++
++# pure-read ceiling: read both tables with a trivial reduction
++def read_both():
++    return fn_q.float().sum() + up_q.float().sum()  # not optimal but shows convert+reduce
++t2 = timeit(lambda: torch.sum(fn_q, dtype=torch.int64) + torch.sum(up_q, dtype=torch.int64), label="pure int8 read (sum) both tables")
++print(f"  -> read-only eff BW {(fn_q.numel()+up_q.numel())/t2/1e3:.0f} GB/s")
++
++# 97 sites back-to-back to mimic per-step amortization (same tables, repeated)
++t3 = timeit(lambda: [ext.gr_mix_int8(streams, fn_q, fn_s, up_q, up_s, w, 1e-6, dots, post, mixed) for _ in range(97)], iters=50, label="97 sites back-to-back (ms)")
++print(f"  -> {t3/1000:.2f} ms/step equivalent")
+diff --git a/scratch/m4_nsys.log b/scratch/m4_nsys.log
+new file mode 100644
+index 0000000..39ce1cc
+--- /dev/null
++++ b/scratch/m4_nsys.log
+@@ -0,0 +1,21 @@
++WARNING: CPU IP/backtrace sampling not supported, disabling.
++Try the 'nsys status --environment' command to learn more.
++
++WARNING: CPU context switch tracing not supported, disabling.
++Try the 'nsys status --environment' command to learn more.
++
++exllamav3 at /home/xujie/qwen38-exl3/exllamav3-spec/exllamav3/__init__.py
++MemAvailable before load: 116.9 GiB
++model loaded in 13s, MemAvailable 62.8 GiB
++WARNING:2026-09-28 12:06:53 3115284:3115284 init.cpp:115] function cbapi.getCuptiStatus() failed with error CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED (39)
++WARNING:2026-09-28 12:06:53 3115284:3115284 init.cpp:116] CUPTI initialization failed - CUDA profiler activities will be missing
++INFO:2026-09-28 12:06:53 3115284:3115284 init.cpp:118] If you see CUPTI_ERROR_INSUFFICIENT_PRIVILEGES, refer to https://developer.nvidia.com/nvidia-development-tools-solutions-err-nvgpuctrperm-cupti
++USDT:2026-09-28 12:06:53 3115284:3115284 SyncActivityProfilerHandler.cpp:52] profiler_start
++USDT:2026-09-28 12:06:54 3115284:3115284 SyncActivityProfilerHandler.cpp:59] profiler_stop
++CTX 500: ptok=366 prefill=2.70s wall mean=26.973ms p50=26.741ms min=26.635 max=28.198
++DONE
++Collecting data...
++Generating '/tmp/nsys-report-17d2.qdstrm'
++[1/1] [0%                          ] m4_nsys.nsys-rep[1/1] [0%                          ] m4_nsys.nsys-rep[1/1] [0%                          ] m4_nsys.nsys-rep[1/1] [5%                          ] m4_nsys.nsys-rep[1/1] [7%                          ] m4_nsys.nsys-rep[1/1] [8%                          ] m4_nsys.nsys-rep[1/1] [9%                          ] m4_nsys.nsys-rep[1/1] [10%                         ] m4_nsys.nsys-rep[1/1] [11%                         ] m4_nsys.nsys-rep[1/1] [13%                         ] m4_nsys.nsys-rep[1/1] [14%                         ] m4_nsys.nsys-rep[1/1] [=15%                        ] m4_nsys.nsys-rep[1/1] [=16%                        ] m4_nsys.nsys-rep[1/1] [==18%                       ] m4_nsys.nsys-rep[1/1] [==19%                       ] m4_nsys.nsys-rep[1/1] [==20%                       ] m4_nsys.nsys-rep[1/1] [===22%                      ] m4_nsys.nsys-rep[1/1] [===23%                      ] m4_nsys.nsys-rep[1/1] [===24%                      ] m4_nsys.nsys-rep[1/1] [====25%                     ] m4_nsys.nsys-rep[1/1] [====27%                     ] m4_nsys.nsys-rep[1/1] [====28%                     ] m4_nsys.nsys-rep[1/1] [=====29%                    ] m4_nsys.nsys-rep[1/1] [=====31%                    ] m4_nsys.nsys-rep[1/1] [=====32%                    ] m4_nsys.nsys-rep[1/1] [======33%                   ] m4_nsys.nsys-rep[1/1] [======35%                   ] m4_nsys.nsys-rep[1/1] [=======36%                  ] m4_nsys.nsys-rep[1/1] [=======37%                  ] m4_nsys.nsys-rep[1/1] [=======38%                  ] m4_nsys.nsys-rep[1/1] [========40%                 ] m4_nsys.nsys-rep[1/1] [========41%                 ] m4_nsys.nsys-rep[1/1] [========42%                 ] m4_nsys.nsys-rep[1/1] [=========43%                ] m4_nsys.nsys-rep[1/1] [=========45%                ] m4_nsys.nsys-rep[1/1] [=========46%                ] m4_nsys.nsys-rep[1/1] [==========47%               ] m4_nsys.nsys-rep[1/1] [==========48%               ] m4_nsys.nsys-rep[1/1] [==========49%               ] m4_nsys.nsys-rep[1/1] [===========50%              ] m4_nsys.nsys-rep[1/1] [===========51%              ] m4_nsys.nsys-rep[1/1] [===========53%              ] m4_nsys.nsys-rep[1/1] [============54%             ] m4_nsys.nsys-rep[1/1] [============55%             ] m4_nsys.nsys-rep[1/1] [============56%             ] m4_nsys.nsys-rep[1/1] [============57%             ] m4_nsys.nsys-rep[1/1] [=============58%            ] m4_nsys.nsys-rep[1/1] [=============59%            ] m4_nsys.nsys-rep[1/1] [==============61%           ] m4_nsys.nsys-rep[1/1] [==============62%           ] m4_nsys.nsys-rep[1/1] [==============63%           ] m4_nsys.nsys-rep[1/1] [==============64%           ] m4_nsys.nsys-rep[1/1] [===============65%          ] m4_nsys.nsys-rep[1/1] [===============66%          ] m4_nsys.nsys-rep[1/1] [===============67%          ] m4_nsys.nsys-rep[1/1] [================69%         ] m4_nsys.nsys-rep[1/1] [================70%         ] m4_nsys.nsys-rep[1/1] [================71%         ] m4_nsys.nsys-rep[1/1] [=================72%        ] m4_nsys.nsys-rep[1/1] [=================73%        ] m4_nsys.nsys-rep[1/1] [=================74%        ] m4_nsys.nsys-rep[1/1] [==================75%       ] m4_nsys.nsys-rep[1/1] [==================77%       ] m4_nsys.nsys-rep[1/1] [==================78%       ] m4_nsys.nsys-rep[1/1] [========================100%] m4_nsys.nsys-rep[1/1] [========================100%] m4_nsys.nsys-rep
++Generated:
++	/home/xujie/qwen38-exl3/exllamav3-spec/scratch/m4_nsys.nsys-rep
+diff --git a/scratch/m4_profile.log b/scratch/m4_profile.log
+new file mode 100644
+index 0000000..6ef2843
+--- /dev/null
++++ b/scratch/m4_profile.log
+@@ -0,0 +1,10 @@
++exllamav3 at /home/xujie/qwen38-exl3/exllamav3-spec/exllamav3/__init__.py
++MemAvailable before load: 117.5 GiB
++model loaded in 26s, MemAvailable 63.7 GiB
++USDT:2026-09-28 11:56:20 3100752:3100752 SyncActivityProfilerHandler.cpp:52] profiler_start
++USDT:2026-09-28 11:56:22 3100752:3100752 SyncActivityProfilerHandler.cpp:59] profiler_stop
++Traceback (most recent call last):
++  File "/home/xujie/qwen38-exl3/exllamav3-spec/scratch/profile_decode_floor.py", line 128, in <module>
++    f"wall mean={meta['wall_mean_ms']}ms p50={meta['wall_p50']}ms "
++                                              ~~~~^^^^^^^^^^^^
++KeyError: 'wall_p50'
+diff --git a/scratch/m4_profile_8k.log b/scratch/m4_profile_8k.log
+new file mode 100644
+index 0000000..4280fd0
+--- /dev/null
++++ b/scratch/m4_profile_8k.log
+@@ -0,0 +1,7 @@
++exllamav3 at /home/xujie/qwen38-exl3/exllamav3-spec/exllamav3/__init__.py
++MemAvailable before load: 117.5 GiB
++model loaded in 12s, MemAvailable 63.7 GiB
++USDT:2026-09-28 12:00:26 3106406:3106406 SyncActivityProfilerHandler.cpp:52] profiler_start
++USDT:2026-09-28 12:00:27 3106406:3106406 SyncActivityProfilerHandler.cpp:59] profiler_stop
++CTX 8000: ptok=5943 prefill=10.03s wall mean=27.745ms p50=27.071ms min=26.941 max=37.637
++DONE
+diff --git a/scratch/m4_sampler_bench.py b/scratch/m4_sampler_bench.py
+new file mode 100644
+index 0000000..30c8d32
+--- /dev/null
++++ b/scratch/m4_sampler_bench.py
+@@ -0,0 +1,36 @@
++import os, time, torch, random
++from exllamav3.generator.sampler import CustomSampler, SS_RepP, SS_Temperature, SS_TopK, SS_TopP, SS_Sample, SS_Argmax
++
++dev = "cuda"
++V = 248832          # padded vocab used by the pack head
++AV = 248320         # actual vocab
++torch.manual_seed(0)
++
++def bench(sampler, logits, past, iters=200, label=""):
++    # warmup
++    for _ in range(10):
++        sampler.forward(logits, sequence_ids=past, rand_u32=1)
++    torch.cuda.synchronize()
++    t0 = time.perf_counter()
++    for _ in range(iters):
++        sampler.forward(logits, sequence_ids=past, rand_u32=1)
++    torch.cuda.synchronize()
++    dt = (time.perf_counter() - t0) / iters * 1000
++    # also CPU-only launch cost (no sync per call, already measured in aggregate)
++    print(f"{label:44s} {dt:7.3f} ms/call")
++    return dt
++
++for rows in (1, 4):
++    logits = torch.randn(rows, 1, V, dtype=torch.half, device=dev) * 5
++    past = torch.randint(0, AV, (rows, 500), dtype=torch.long, device=dev)
++    serve = CustomSampler([SS_RepP(1.05, int(10e7), 1), SS_Temperature(0.6), SS_TopK(20), SS_TopP(0.95), SS_Sample()])
++    print("serve stack steps:", [type(s).__name__ for s in serve.steps])
++    bench(serve, logits, past, label=f"serve stack (rep1.05+t0.6+k20+p0.95) rows={rows}")
++    greedy = CustomSampler([SS_Argmax()])
++    bench(greedy, logits, past, label=f"argmax only rows={rows}")
++    fused_only = CustomSampler([SS_Temperature(0.6), SS_TopK(20), SS_TopP(0.95), SS_Sample()])
++    print("fused-only steps:", [type(s).__name__ for s in fused_only.steps])
++    bench(fused_only, logits, past, label=f"fused tail only rows={rows}")
++    repp = CustomSampler([SS_RepP(1.05, int(10e7), 1), SS_Argmax()])
++    print("repp steps:", [type(s).__name__ for s in repp.steps])
++    bench(repp, logits, past, label=f"rep-penalty + argmax rows={rows}")
+diff --git a/scratch/m4nsys.ctx500.keyavg.txt b/scratch/m4nsys.ctx500.keyavg.txt
+new file mode 100644
+index 0000000..7eee9c2
+--- /dev/null
++++ b/scratch/m4nsys.ctx500.keyavg.txt
+@@ -0,0 +1,45 @@
++-----------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
++                         Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls  
++-----------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
++                  aten::slice        18.53%       3.698ms        27.81%       5.549ms       0.543us         10220  
++             aten::as_strided         9.57%       1.909ms         9.57%       1.909ms       0.181us         10560  
++                  aten::zero_         0.02%       4.176us         0.02%       4.176us       0.209us            20  
++                  aten::alias         0.16%      31.039us         0.16%      31.039us       0.517us            60  
++                  aten::copy_         8.10%       1.617ms         8.10%       1.617ms       4.042us           400  
++             aten::lift_fresh         0.03%       5.376us         0.03%       5.376us       0.134us            40  
++                 aten::select         0.73%     145.247us         0.88%     175.871us       0.879us           200  
++                 aten::narrow         0.46%      92.239us         1.26%     250.973us       1.141us           220  
++                    aten::cat         2.04%     406.413us         2.40%     479.677us       3.997us           120  
++                     aten::to         2.53%     505.436us         8.36%       1.668ms       0.525us          3180  
++                    aten::max         2.75%     548.922us         3.82%     762.376us       1.466us           520  
++                  aten::empty         6.26%       1.249ms         6.26%       1.249ms       1.249us          1000  
++                  aten::fill_         1.13%     225.643us         1.18%     236.059us       0.437us           540  
++                   aten::item         1.00%     198.558us         1.16%     232.109us       0.387us           600  
++    aten::_local_scalar_dense         0.17%      33.551us         0.17%      33.551us       0.056us           600  
++           aten::resolve_conj         0.03%       6.048us         0.03%       6.048us       0.151us            40  
++            aten::resolve_neg         0.02%       3.872us         0.02%       3.872us       0.097us            40  
++                  aten::stack         0.21%      41.472us         1.93%     385.340us       6.422us            60  
++                   aten::view        13.37%       2.667ms        13.37%       2.667ms       0.135us         19720  
++              aten::embedding         0.12%      23.728us         0.56%     112.479us       5.624us            20  
++                aten::reshape         6.84%       1.364ms        11.35%       2.265ms       0.391us          5800  
++           aten::index_select         1.34%     266.557us         1.82%     363.147us       9.079us            40  
++               aten::_to_copy         0.45%      90.591us         5.83%       1.162ms       8.303us           140  
++          aten::empty_strided         9.89%       1.973ms         9.89%       1.973ms       2.192us           900  
++              aten::is_pinned         0.79%     157.872us         0.79%     157.872us       1.973us            80  
++              aten::unsqueeze         0.10%      20.192us         0.16%      31.568us       0.526us            60  
++                 aten::expand         0.06%      12.368us         0.09%      18.624us       0.931us            20  
++             aten::contiguous         0.04%       7.488us         1.29%     257.662us      12.883us            20  
++                  aten::clone         0.11%      22.272us         1.41%     280.829us       7.021us            40  
++             aten::empty_like         1.24%     246.863us         9.94%       1.984ms       2.610us           760  
++                aten::resize_         0.44%      87.774us         0.44%      87.774us       2.194us            40  
++                 aten::matmul         0.10%      19.152us         3.14%     626.940us      15.674us            40  
++                     aten::mm         3.05%     607.788us         3.05%     607.788us      15.195us            40  
++                    aten::bmm         2.90%     578.124us         2.90%     578.124us      28.906us            20  
++              aten::transpose         0.09%      18.624us         0.12%      23.248us       0.581us            40  
++                 aten::conv1d         0.11%      21.759us         3.46%     690.412us      34.521us            20  
++            aten::convolution         0.15%      30.304us         3.35%     668.653us      33.433us            20  
++           aten::_convolution         1.43%     285.679us         3.20%     638.349us      31.917us            20  
++      aten::_conv_depthwise2d         0.74%     147.295us         1.14%     227.855us      11.393us            20  
++                aten::squeeze         0.50%      99.647us         0.53%     105.711us       5.286us            20  
++-----------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
++Self CPU time total: 19.955ms
+diff --git a/scratch/m4nsys.ctx500.wall.json b/scratch/m4nsys.ctx500.wall.json
+new file mode 100644
+index 0000000..8947fba
+--- /dev/null
++++ b/scratch/m4nsys.ctx500.wall.json
+@@ -0,0 +1,34 @@
++{
++ "ctx_target": 500,
++ "prompt_tokens": 366,
++ "prefill_s": 2.699,
++ "prefill_tok_s": 135.6,
++ "steps": 20,
++ "wall_mean_ms": 26.973,
++ "wall_p50_ms": 26.741,
++ "wall_min_ms": 26.635,
++ "wall_max_ms": 28.198,
++ "wall_total_s_prof_region": 0.628,
++ "walls_ms": [
++  28.065,
++  28.198,
++  26.802,
++  26.72,
++  26.707,
++  26.741,
++  27.272,
++  26.734,
++  26.888,
++  26.773,
++  27.476,
++  26.684,
++  26.692,
++  26.724,
++  27.27,
++  26.702,
++  26.696,
++  26.74,
++  26.635,
++  26.95
++ ]
++}
+\ No newline at end of file
+diff --git a/scratch/profile_decode_floor.py b/scratch/profile_decode_floor.py
+new file mode 100644
+index 0000000..4225dc4
+--- /dev/null
++++ b/scratch/profile_decode_floor.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++"""M4: decompose the ~34ms/step EXL3 decode floor on GB10.
++
++Loads the 3bpw pack (no draft model), prefills a ~N-token prompt, then runs
++pure greedy decode batch-1: warmup steps, then profiled steps under
++torch.profiler (CPU+CUDA). Per-step wall clock is measured with
++cuda.synchronize around each gen.iterate().
++
++Outputs per ctx:
++  <prefix>.ctx<N>.trace.json   chrome trace
++  <prefix>.ctx<N>.keyavg.txt   key_averages sorted by self device time
++  <prefix>.ctx<N>.wall.json    per-step wall times + prefill stats
++"""
++import argparse, json, os, sys, threading, time
++import torch
++
++FILLER = ("The maintenance log for reactor bay seven records a pressure excursion at "
++          "oh four hundred hours, followed by a manual override and a return to nominal. "
++          "Subsequent inspection found no fault in the primary loop. ")
++
++def build(ntok, salt):
++    reps = max(1, int(ntok * 4 / len(FILLER)))
++    return "Record %d. " % salt + FILLER * reps + "\n\nSummarize the above in one sentence."
++
++def mem_avail_gib():
++    for line in open("/proc/meminfo"):
++        if line.startswith("MemAvailable"):
++            return int(line.split()[1]) / 2**20
++    return 0.0
++
++def watchdog(floor_gib):
++    while True:
++        m = mem_avail_gib()
++        if m < floor_gib:
++            print(f"WATCHDOG: MemAvailable {m:.2f} GiB < {floor_gib} GiB, aborting", flush=True)
++            os._exit(3)
++        time.sleep(1.0)
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--model", required=True)
++ap.add_argument("--ctxs", default="500,8000")
++ap.add_argument("--warmup", type=int, default=10)
++ap.add_argument("--steps", type=int, default=50)
++ap.add_argument("--floor-gib", type=float, default=2.0)
++ap.add_argument("--out-prefix", required=True)
++a = ap.parse_args()
++
++from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler
++from torch.profiler import profile, ProfilerActivity
++
++threading.Thread(target=watchdog, args=(a.floor_gib,), daemon=True).start()
++print(f"exllamav3 at {__import__('exllamav3').__file__}", flush=True)
++print(f"MemAvailable before load: {mem_avail_gib():.1f} GiB", flush=True)
++
++t0 = time.time()
++config = Config.from_directory(a.model)
++model = Model.from_config(config)
++maxctx = max(int(c) for c in a.ctxs.split(","))
++maxctx = max(4096, ((maxctx + 512 + 255) // 256) * 256)
++cache = Cache(model, max_num_tokens=maxctx, max_history=0, max_batch_size=1)
++model.load(progressbar=False)
++tokenizer = Tokenizer.from_config(config)
++print(f"model loaded in {time.time()-t0:.0f}s, MemAvailable {mem_avail_gib():.1f} GiB", flush=True)
++
++gen = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=2048)
++
++def drain():
++    for r in gen.iterate():
++        pass
++
++for ctx in [int(c) for c in a.ctxs.split(",")]:
++    total_new = a.warmup + a.steps
++    ids = tokenizer.encode(build(ctx, 42), add_bos=False)
++    ptok = int(ids.shape[-1])
++    job = Job(input_ids=ids, max_new_tokens=total_new, min_new_tokens=total_new,
++              sampler=ArgmaxSampler(), seed=0)
++    gen.enqueue(job)
++
++    # prefill (ends when the first decode token exists)
++    tp0 = time.perf_counter()
++    while job.new_tokens < 1 and gen.num_remaining_jobs():
++        drain()
++    torch.cuda.synchronize()
++    prefill_s = time.perf_counter() - tp0
++
++    # warmup decode steps (first token already counts as step 1)
++    for _ in range(a.warmup - 1):
++        drain()
++    torch.cuda.synchronize()
++
++    # profiled decode steps
++    walls = []
++    tall0 = time.perf_counter()
++    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
++        for _ in range(a.steps):
++            torch.cuda.synchronize()
++            t1 = time.perf_counter()
++            drain()
++            torch.cuda.synchronize()
++            walls.append(time.perf_counter() - t1)
++    tall = time.perf_counter() - tall0
++
++    prefix = f"{a.out_prefix}.ctx{ctx}"
++    prof.export_chrome_trace(prefix + ".trace.json")
++    try:
++        tbl = prof.key_averages().table(sort_by="self_device_time_total", row_limit=40)
++    except Exception:
++        tbl = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=40)
++    with open(prefix + ".keyavg.txt", "w") as f:
++        f.write(tbl)
++    walls_ms = [w * 1000 for w in walls]
++    sw = sorted(walls_ms)
++    meta = {
++        "ctx_target": ctx, "prompt_tokens": ptok,
++        "prefill_s": round(prefill_s, 3),
++        "prefill_tok_s": round(ptok / prefill_s, 1),
++        "steps": a.steps,
++        "wall_mean_ms": round(sum(walls_ms) / len(walls_ms), 3),
++        "wall_p50_ms": round(sw[len(sw) // 2], 3),
++        "wall_min_ms": round(sw[0], 3),
++        "wall_max_ms": round(sw[-1], 3),
++        "wall_total_s_prof_region": round(tall, 3),
++        "walls_ms": [round(w, 3) for w in walls_ms],
++    }
++    with open(prefix + ".wall.json", "w") as f:
++        json.dump(meta, f, indent=1)
++    print(f"CTX {ctx}: ptok={ptok} prefill={prefill_s:.2f}s "
++          f"wall mean={meta['wall_mean_ms']}ms p50={meta['wall_p50_ms']}ms "
++          f"min={meta['wall_min_ms']} max={meta['wall_max_ms']}", flush=True)
++
++print("DONE", flush=True)
+diff --git a/tests/test_gr_mix_tiled.py b/tests/test_gr_mix_tiled.py
+index 9dde478..7e804cc 100644
+--- a/tests/test_gr_mix_tiled.py
++++ b/tests/test_gr_mix_tiled.py
+@@ -78,6 +78,25 @@ class TestGrMixTiled(unittest.TestCase):
+                 post2, mixed2 = m._mix(x, cached = False)
+                 self.assertTrue(torch.equal(mixed, mixed2) and torch.equal(post, post2))
+ 
++    @unittest.skipUnless(os.environ.get("EXL3_GR_TUNED") == "1", "tuned kernel disabled")
++    def test_tuned_fused_decode(self):
++        # EXL3_GR_TUNED=1 routes R <= 4 gr_mix_int8 calls through the cooperative fused
++        # kernel (R > 4 stays on the stock pair); both must match the fp32 reference to
++        # tolerance and be bit-reproducible
++        m = make_site(2560, 320, True)
++        for R in (1, 2, 3, 4, 8):
++            torch.manual_seed(R + 100)
++            x = torch.randn(1, R, 4, 2560, device = DEVICE) * 3.0
++            ref_post, ref_mixed = m._mix_ref(x)
++            post, mixed = m._mix(x, cached = False)
++            self.assertLess(rel(mixed, ref_mixed.view(R, 2560)), 3e-3, R)
++            # post tolerance is looser than the stock-pair test's 1e-3: the stock
++            # kernel itself deviates up to ~2.5e-3 from the fp32 reference on these
++            # seeds, so the tuned kernel is only required to land in the same band
++            self.assertLess(rel(post, ref_post.view(R, 4)), 5e-3, R)
++            post2, mixed2 = m._mix(x, cached = False)
++            self.assertTrue(torch.equal(mixed, mixed2) and torch.equal(post, post2))
++
+     def test_tiled_is_deterministic(self):
+         m = make_site(1024, 320, True)
+         for R in (100, 2048):
+diff --git a/tests/test_hybrid_draft_cpu.py b/tests/test_hybrid_draft_cpu.py
+new file mode 100644
+index 0000000..25e4c32
+--- /dev/null
++++ b/tests/test_hybrid_draft_cpu.py
+@@ -0,0 +1,300 @@
++import sys, os
++sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++import random
++import torch
++from types import SimpleNamespace
++
++from exllamav3.generator.generator import Generator, _hybrid_pad_rows
++from exllamav3.generator.job import Job
++from exllamav3.ext import exllamav3_ext as ext
++
++"""
++M3 hybrid ngram+MTP drafting (EXL3_HYBRID_NGRAM) — CPU gates. All CPU, no model, no GPU.
++
++- test_pad_rows: mixed-width assembly, pad token, None rows.
++- test_sam_intermittent_parity: BC_SAM.accept_tensor consumes history incrementally, so
++  probing every few tokens (ngram this round, MTP the next) must track one-shot feeding.
++- test_sam_rewind_rebuild: a shrinking sequence (banned-string rewind) rebuilds the
++  automaton instead of corrupting it.
++- test_probe_gate: Job.probe_ngram_draft match-length gate and continuation capping.
++- test_hybrid_selection: Generator.iterate_hybrid_gen source choice — pure-MTP fallback,
++  pure-ngram (no drafter forward, stale draft state cleared), mixed (row overwrite,
++  spec suppression, calibrator-skip set).
++- test_verify_walk_with_pads / test_hybrid_account: pad positions verify as ordinary
++  draft positions, and per-source accounting clamps pad-luck accepts to the real width.
++
++Standalone: python tests/test_hybrid_draft_cpu.py
++"""
++
++
++class _SeqStub:
++    def __init__(self, ids):
++        self.sequence_ids = SimpleNamespace(torch = lambda: ids.view(1, -1))
++
++
++def _job_stub(ids):
++    return SimpleNamespace(sam = ext.BC_SAM(), sequences = [_SeqStub(ids)])
++
++
++def _gen_stub():
++    g = Generator.__new__(Generator)
++    g.hybrid_ngram = True
++    g.hybrid_ngram_min_match = 4
++    g.hybrid_ngram_max = 8
++    g._hybrid_round_src = None
++    g._hybrid_ngram_jobs = set()
++    g._hybrid_suppress_spec = False
++    g._hybrid_stats = {
++        "rounds": 0, "ng_rounds": 0,
++        "ng_drafted": 0, "ng_accepted": 0,
++        "mtp_drafted": 0, "mtp_accepted": 0,
++    }
++    g._spec_shadow_logq = None
++    g._spec_draft_specs = None
++    g._draft_conf_round = None
++    return g
++
++
++def _sel_job(cand):
++    # Minimal job for iterate_hybrid_gen: prefill done, single sequence, canned probe
++    return SimpleNamespace(
++        sequences = [object()],
++        sam = object() if cand is not None else None,
++        is_prefill_done = lambda: True,
++        probe_ngram_draft = lambda n, m: cand,
++    )
++
++
++def test_pad_rows():
++    a = torch.tensor([[1, 2, 3]])
++    b = torch.tensor([[7]])
++    out = _hybrid_pad_rows([a, None, b], pad_token = 0)
++    assert out.shape == (3, 3)
++    assert out[0].tolist() == [1, 2, 3]
++    assert out[1].tolist() == [0, 0, 0]
++    assert out[2].tolist() == [7, 0, 0]
++    assert out.dtype == torch.long
++    print("pad rows ok")
++
++
++def test_sam_intermittent_parity():
++    # A sequence ending in a repeated block: noise + block + gap + block + gap + block
++    random.seed(1)
++    block = [random.randint(1000, 60000) for _ in range(11)]
++    seq = [3, 4] + block + [7, 8] + block + [9] + block
++    ids = torch.tensor(seq, dtype = torch.long)
++
++    # One-shot
++    sam1 = ext.BC_SAM()
++    r1 = sam1.accept_tensor(ids)
++
++    # Intermittent: probe every 1-4 tokens (ngram/MTP round mix)
++    sam2 = ext.BC_SAM()
++    pos = 0
++    r2 = (-1, -1)
++    while pos < len(seq):
++        step = random.randint(1, 4)
++        pos = min(pos + step, len(seq))
++        r2 = sam2.accept_tensor(ids[:pos])
++
++    assert r1 == r2, (r1, r2)
++    assert r1[1] - r1[0] >= len(block), r1
++    # The continuation after the earliest occurrence is inside the sequence
++    assert 0 <= r1[0] < r1[1] < len(seq)
++    print(f"sam intermittent parity ok (match_len={r1[1] - r1[0]})")
++
++
++def test_sam_rewind_rebuild():
++    block = [10, 20, 30, 40, 50]
++    ids = torch.tensor(block + [99] + block + [98] + block, dtype = torch.long)
++    sam = ext.BC_SAM()
++    sam.accept_tensor(ids)
++    # Rewind: sequence shrinks (banned-string suppression); automaton must rebuild
++    short = ids[:7]
++    beg, end = sam.accept_tensor(short)
++    assert end - beg >= 0
++    # And keep working correctly afterwards
++    ids2 = torch.cat((short, torch.tensor(block, dtype = torch.long)))
++    beg2, end2 = sam.accept_tensor(ids2)
++    assert end2 - beg2 >= 5
++    print("sam rewind rebuild ok")
++
++
++def test_probe_gate():
++    block = [101, 102, 103, 104, 105, 106]
++    # Sequence ends with a repeat of block; the match is the trailing block and the
++    # draft copies what followed the FIRST occurrence: [1, 2] then the block again
++    seq = block + [1, 2] + block
++    ids = torch.tensor(seq, dtype = torch.long)
++    job = _job_stub(ids)
++    draft, mlen = Job.probe_ngram_draft(job, 8, 4)
++    assert mlen == len(block)
++    assert draft[0].tolist() == [1, 2] + block[:6]
++
++    # draft_length caps the continuation
++    job = _job_stub(ids)
++    draft, _ = Job.probe_ngram_draft(job, 3, 4)
++    assert draft[0].tolist() == [1, 2, 101]
++
++    # min_match above the repeat length -> empty draft, match still reported
++    job2 = _job_stub(ids)
++    draft2, mlen2 = Job.probe_ngram_draft(job2, 8, 100)
++    assert draft2.shape[-1] == 0 and mlen2 == len(block)
++
++    # No repeat at all -> empty draft, zero match
++    job3 = _job_stub(torch.arange(50, dtype = torch.long))
++    draft3, mlen3 = Job.probe_ngram_draft(job3, 8, 4)
++    assert draft3.shape[-1] == 0 and mlen3 == 0
++    print("probe gate ok")
++
++
++def test_hybrid_selection():
++    g = _gen_stub()
++    cand = torch.tensor([[11, 12, 13, 14, 15]])
++
++    calls = []
++    def fake_mtp(results):
++        calls.append(g._hybrid_suppress_spec)
++        g._spec_shadow_logq = ["logq"]
++        g._spec_draft_specs = ["specs"]
++        g._draft_conf_round = {"ids": None}
++        return torch.tensor([[21, 22], [23, 24]])
++    g.iterate_draftmodel_mtp_gen = fake_mtp
++
++    # Pure MTP round: no candidates
++    g.active_jobs = [_sel_job(None), _sel_job(None)]
++    out = Generator.iterate_hybrid_gen(g, [])
++    assert calls == [False]
++    assert out.tolist() == [[21, 22], [23, 24]]
++    assert all(v[0] == "mtp" and v[1] == 2 for v in g._hybrid_round_src.values())
++    assert g._hybrid_stats["rounds"] == 1 and g._hybrid_stats["ng_rounds"] == 0
++
++    # Pure ngram round: MTP drafter not called, stale draft state cleared
++    g.active_jobs = [_sel_job((cand, 6)), _sel_job((torch.tensor([[31]]), 5))]
++    out = Generator.iterate_hybrid_gen(g, [])
++    assert calls == [False], "pure ngram round must skip the MTP draft forward"
++    assert out.shape == (2, 5)
++    assert out[0].tolist() == [11, 12, 13, 14, 15]
++    assert out[1].tolist() == [31, 0, 0, 0, 0]
++    assert g._spec_shadow_logq is None and g._spec_draft_specs is None
++    assert g._draft_conf_round is None
++    assert len(g._hybrid_ngram_jobs) == 2
++    assert all(v[0] == "ngram" for v in g._hybrid_round_src.values())
++    assert g._hybrid_stats["ng_rounds"] == 1
++
++    # Mixed round: MTP runs with spec suppressed, ngram row overwrites, wider window pads
++    g._spec_shadow_logq = None
++    g.active_jobs = [_sel_job((cand, 6)), _sel_job(None)]
++    out = Generator.iterate_hybrid_gen(g, [])
++    assert calls == [False, True], "mixed round must suppress spec drafting"
++    assert out.shape == (2, 5)
++    assert out[0].tolist() == [11, 12, 13, 14, 15]
++    assert out[1].tolist() == [23, 24, 0, 0, 0]
++    assert g._spec_shadow_logq is None, "shadow rows describe discarded MTP drafts"
++    assert len(g._hybrid_ngram_jobs) == 1
++    kinds = sorted(v[0] for v in g._hybrid_round_src.values())
++    assert kinds == ["mtp", "ngram"]
++    assert g._hybrid_suppress_spec is False, "flag must reset after the draft call"
++
++    # Mixed round with no MTP carry (mtp returns None): ngram rows still draft,
++    # the other row is all-pad
++    g.iterate_draftmodel_mtp_gen = lambda results: None
++    g.active_jobs = [_sel_job((cand, 6)), _sel_job(None)]
++    out = Generator.iterate_hybrid_gen(g, [])
++    assert out.shape == (2, 5)
++    assert out[0].tolist() == [11, 12, 13, 14, 15]
++    assert out[1].tolist() == [0, 0, 0, 0, 0]
++    print("hybrid selection ok")
++
++
++def test_verify_walk_with_pads():
++    # Emulate the legacy match-verify loop over an assembled padded draft: positions
++    # accept while the target samples the draft token; the first mismatch rejects the
++    # remainder. Pad tokens (0) accept only on a lucky target match.
++    drafts = _hybrid_pad_rows([torch.tensor([[5, 6, 7]]), torch.tensor([[9]])])
++    target = [5, 6, 42]   # row 0: accept 2, reject at 2; row 1 would accept 1 if target[0]==9
++    accepted = 1
++    for i in range(drafts.shape[-1]):
++        if i >= len(target) or drafts[0, i].item() != target[i]:
++            break
++        accepted += 1
++    assert accepted == 3  # 1 sampled + 2 accepted drafts
++
++    # Lucky pad: target samples 0 at the pad position -> accepted, still exact
++    drafts2 = _hybrid_pad_rows([torch.tensor([[9, 0]])])
++    target2 = [9, 0]
++    accepted2 = 1
++    for i in range(drafts2.shape[-1]):
++        if i >= len(target2) or drafts2[0, i].item() != target2[i]:
++            break
++        accepted2 += 1
++    assert accepted2 == 3
++    print("verify walk with pads ok")
++
++
++def test_hybrid_account():
++    g = _gen_stub()
++    j1, j2, j3 = (SimpleNamespace(serial_number = i) for i in range(3))
++    g.active_jobs = [j1, j2, j3]
++    g._hybrid_round_src = {
++        id(j1): ("ngram", 5),
++        id(j2): ("mtp", 2),
++        id(j3): ("ngram", 4),
++    }
++    # j3's window was abandoned (rewind) and must be skipped; j1 accepted past its real
++    # width via a pad match (accepted_length 7 > width 5 + 1) and must clamp
++    logit_mapping = [0, 3, 5, 8]
++    accepted_lengths = [7, 2, 3]
++    Generator._hybrid_account(g, logit_mapping, accepted_lengths, {id(j3)})
++    st = g._hybrid_stats
++    assert st["ng_drafted"] == 5 and st["ng_accepted"] == 5, st
++    assert st["mtp_drafted"] == 2 and st["mtp_accepted"] == 1, st
++    assert g._hybrid_round_src is None
++    print("hybrid account ok")
++
++
++def test_ng_adaptive():
++    import exllamav3.generator.generator as G
++    old = (G._HYBRID_ADAPT_ROUNDS, G._HYBRID_PROBE_ROUNDS, G._HYBRID_MIN_ACC)
++    G._HYBRID_ADAPT_ROUNDS, G._HYBRID_PROBE_ROUNDS, G._HYBRID_MIN_ACC = 4, 3, 0.25
++    try:
++        g = _gen_stub()
++        j = SimpleNamespace(serial_number = 7)
++        assert Generator._hybrid_ng_engaged(g, j)  # default on
++
++        # Four ngram rounds accepting 1/16 each (0.0625 < 0.25) -> disengage
++        for _ in range(4):
++            g.active_jobs = [j]
++            g._hybrid_round_src = {id(j): ("ngram", 16)}
++            Generator._hybrid_account(g, [0, 9], [2], set())
++        assert j._ng_on is False
++        assert not Generator._hybrid_ng_engaged(g, j)
++
++        # Re-probe after PROBE_ROUNDS off-rounds
++        assert not Generator._hybrid_ng_engaged(g, j)
++        assert Generator._hybrid_ng_engaged(g, j)  # 3rd call re-engages
++        assert j._ng_on is True
++
++        # Good acceptance keeps it engaged
++        j2 = SimpleNamespace(serial_number = 8)
++        for _ in range(8):
++            g.active_jobs = [j2]
++            g._hybrid_round_src = {id(j2): ("ngram", 16)}
++            Generator._hybrid_account(g, [0, 9], [14], set())
++        assert getattr(j2, "_ng_on", True) is True
++    finally:
++        G._HYBRID_ADAPT_ROUNDS, G._HYBRID_PROBE_ROUNDS, G._HYBRID_MIN_ACC = old
++    print("ng adaptive ok")
++
++
++if __name__ == "__main__":
++    torch.manual_seed(0)
++    test_pad_rows()
++    test_sam_intermittent_parity()
++    test_sam_rewind_rebuild()
++    test_probe_gate()
++    test_hybrid_selection()
++    test_verify_walk_with_pads()
++    test_hybrid_account()
++    test_ng_adaptive()
++    print("all hybrid-draft CPU gates passed")
+diff --git a/tests/test_spec_sampling_cpu.py b/tests/test_spec_sampling_cpu.py
+new file mode 100644
+index 0000000..4e1d1cf
+--- /dev/null
++++ b/tests/test_spec_sampling_cpu.py
+@@ -0,0 +1,262 @@
++import sys, os
++sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++import math
++import random
++import torch
++from types import SimpleNamespace
++
++from exllamav3.generator.generator import Generator
++from exllamav3.generator.spec_sampling import (
++    SpecTransform,
++    spec_transform,
++    shaped_q,
++    q_sample,
++    spec_accept,
++    spec_residual_probs,
++    SPEC_Q_TEMP,
++    SPEC_Q_TOP_K,
++    SPEC_Q_TOP_P,
++)
++
++"""
++M2 exact speculative sampling — CPU gates (design §5/§6). All CPU, no model, no GPU.
++
++- test_emitted_distribution_exact: the hard gate. The spec algorithm (draft d ~ shaped q,
++  accept iff log u < min(0, logp(d) - logq(d)), reject -> renorm((p - q)+)) is simulated
++  vectorized over 200k draws using the same primitives the generator calls; the emitted
++  token distribution must be statistically indistinguishable from p (chi-square), and the
++  measured acceptance must match E[sum min(p, q)].
++- test_residual_edge_cases: p ⟂ q and p == q.
++- test_verify_job_bookkeeping: drives Generator._spec_verify_job with a stub job through
++  a full-accept window and an immediate-reject window, asserting the emitted-token /
++  accepted_length invariant the post-batch MTP carry relies on
++  (mtp_last_hidden = target_hidden[accepted_length - 1] must be the last accepted
++  position, design §8.2).
++
++Standalone: python tests/test_spec_sampling_cpu.py
++"""
++
++device = "cpu"
++
++
++def _rand_pq(vocab, n2, seed):
++    g = torch.Generator().manual_seed(seed)
++    logits = torch.randn(vocab, generator = g) * 2.0
++    logp = torch.log_softmax(logits, dim = -1)
++    logq_raw = torch.randn(n2, generator = g) * 2.0
++    return logp, torch.log_softmax(logq_raw, dim = -1)
++
++
++def test_emitted_distribution_exact():
++    vocab, n2, n = 256, 128, 200_000
++    logp, logq_raw = _rand_pq(vocab, n2, seed = 7)
++    p = logp.exp()
++    logq = shaped_q(logq_raw)
++    q = logq.exp()
++
++    gen = torch.Generator().manual_seed(1234)
++    # Draft d ~ q, accept with min(1, p(d)/q(d)) via the generator's log-space test,
++    # reject -> renorm((p - q)+); all vectorized, same math as Generator._spec_verify_job
++    d = torch.multinomial(q, n, replacement = True, generator = gen)
++    logu = torch.rand(n, generator = gen).log()
++    thresh = torch.minimum(torch.zeros(n), logp[d] - logq[d])
++    accept = logu < thresh
++    residual = spec_residual_probs(logp, logq)
++    r = torch.multinomial(residual, n, replacement = True, generator = gen)
++    emitted = torch.where(accept, d, r)
++
++    # Measured acceptance vs the theoretical total-variation overlap
++    overlap = float(torch.minimum(p[:n2], q).sum())
++    acc = float(accept.float().mean())
++    print(f"acceptance={acc:.4f} vs E[sum min(p,q)]={overlap:.4f}")
++    assert abs(acc - overlap) < 0.01
++
++    # Chi-square of emitted tokens against p over the full vocabulary
++    counts = torch.bincount(emitted, minlength = vocab).double()
++    expected = p.double() * n
++    big = expected >= 5.0
++    chi2 = float(((counts[big] - expected[big]) ** 2 / expected[big]).sum())
++    df = int(big.sum()) - 1
++    limit = df + 6.0 * math.sqrt(2.0 * df)
++    print(f"exactness: n={n} bins={int(big.sum())} chi2={chi2:.1f} df={df} "
++          f"chi2/df={chi2 / df:.3f} (limit {limit:.1f})")
++    assert chi2 < limit, f"emitted distribution differs from p: chi2={chi2:.1f}"
++
++
++def test_residual_edge_cases():
++    vocab, n2 = 64, 32
++
++    # p ⟂ q: q one-hot on token 5 (top_k=1 shaping), p has zero mass there -> every
++    # draft is rejected and the residual is exactly p
++    g = torch.Generator().manual_seed(3)
++    logits = torch.randn(vocab, generator = g)
++    logits[5] = -float("inf")
++    logp = torch.log_softmax(logits, dim = -1)
++    logq = torch.log_softmax(torch.randn(n2, generator = g), dim = -1)
++    logq = torch.where(
++        torch.arange(n2) == 5, torch.zeros(n2), torch.full((n2,), -float("inf"))
++    )
++    assert not spec_accept(-10.0, float(logp[5]), float(logq[5]))  # p(d) = 0 -> reject
++    residual = spec_residual_probs(logp, logq)
++    assert torch.allclose(residual, logp.exp(), atol = 1e-6)
++
++    # q outside the pruned-head slice is zero: logqd = -inf accepts with probability 1
++    assert spec_accept(-1e30, float(logp[40]), -float("inf"))
++
++    # p == q as distributions (p's mass entirely inside the slice): acceptance is 1
++    # (log u < 0 for every u in [0, 1)) and the degenerate residual falls back to p
++    g2 = torch.Generator().manual_seed(4)
++    logits2 = torch.randn(vocab, generator = g2)
++    logits2[n2:] = -float("inf")
++    logp2 = torch.log_softmax(logits2, dim = -1)
++    logq2 = logp2[:n2].clone()
++    for u in (0.0, 1e-9, 0.3, 0.9, 0.999999):
++        assert spec_accept(math.log(u) if u > 0 else -float("inf"), float(logp2[7]), float(logq2[7]))
++    residual = spec_residual_probs(logp2, logq2)
++    assert torch.allclose(residual, logp2.exp(), atol = 1e-6)
++    print("residual edge cases ok")
++
++
++class _StubJob:
++    """
++    Minimal Job stand-in for _spec_verify_job. receive_sample appends the token to the
++    recorded emission log (the real one also advances sequence_ids / kv_position, which
++    the MTP carry then reads back via accepted_lengths).
++    """
++    def __init__(self, bonus_token):
++        self.sequences = [object()]
++        self.rng = random.Random(0)
++        self.current_device_ids = None
++        self.rejected_draft_tokens = 0
++        self.accepted_draft_tokens = 0
++        self.checkpoint_rewound = False
++        self.emitted = []
++        self._bonus = bonus_token
++
++    def receive_logits(self, token_logits):
++        return torch.tensor([[self._bonus]], dtype = torch.long), None, None, None
++
++    def receive_sample(self, token_logits, next_token, next_k_tokens, next_k_probs, next_prob, results):
++        self.emitted.append(int(next_token.view(-1)[0]))
++        return False, next_token, False
++
++    def prepare_logit_mask(self):
++        pass
++
++    def prepare_sampling_past_ids(self):
++        pass
++
++
++def _run_verify_window(job, logp_row, logq_rows_list, draft_tokens_row):
++    vocab = logp_row.shape[-1]
++    window = len(logq_rows_list)
++    job_logits = logp_row.view(1, 1, vocab).repeat(1, window + 1, 1)
++    draft_tokens = draft_tokens_row.view(1, window)
++    g = SimpleNamespace(
++        _spec_draft_specs = [SpecTransform()],  # temp 1.0, no penalties
++        _spec_shadow_logq = [row.view(1, -1) for row in logq_rows_list],
++        tokenizer = SimpleNamespace(actual_vocab_size = vocab),
++    )
++    reject_calls = []
++    def fake_reject(job_, j_, i_, bs_):
++        reject_calls.append((j_, i_))
++        job_.rejected_draft_tokens += job_logits.shape[1] - 1 - i_
++        return job_logits.shape[1] - 1 - i_
++    accepted_length, rejected = Generator._spec_verify_job(
++        g, job, 0, job_logits, draft_tokens, None, [], set(), [], [], fake_reject,
++    )
++    return accepted_length, rejected, reject_calls
++
++
++def test_verify_job_bookkeeping():
++    vocab, n2, window = 64, 32, 4
++    logp, logq_raw = _rand_pq(vocab, n2, seed = 11)
++    logq = shaped_q(logq_raw)
++    drafts = torch.tensor([int(logq.argmax())] * window, dtype = torch.long)
++
++    # Full-accept window: p == q over the slice (p(d) == q(d) -> thresh 0 -> accept
++    # every position), then a bonus token from the real sampler call
++    same = torch.full((vocab,), -float("inf"))
++    same[:n2] = logq
++    job = _StubJob(bonus_token = 61)
++    accepted_length, rejected, reject_calls = _run_verify_window(
++        job, same, [logq_raw] * window, drafts
++    )
++    assert rejected == 0 and not reject_calls
++    assert job.emitted == drafts.tolist() + [61], job.emitted
++    assert job.accepted_draft_tokens == window
++    # MTP carry invariant (design 8.2): accepted_length must equal the number of tokens
++    # consumed this round, so target_hidden[accepted_length - 1] is the last accepted
++    # position and the draft-cache realignment re-prefills exactly the accepted drafts
++    assert accepted_length == len(job.emitted) == window + 1
++
++    # Immediate reject: p(d_0) = 0 -> deterministic rejection at position 0, one
++    # residual token emitted, remainder rejected from position 0
++    block = logp.clone()
++    block[int(drafts[0])] = -float("inf")
++    block = torch.log_softmax(block, dim = -1)
++    job = _StubJob(bonus_token = 61)
++    accepted_length, rejected, reject_calls = _run_verify_window(
++        job, block, [logq_raw] * window, drafts
++    )
++    assert reject_calls == [(0, 0)]
++    assert rejected == window
++    assert len(job.emitted) == 1 and job.emitted[0] != int(drafts[0])
++    assert job.accepted_draft_tokens == 0
++    assert accepted_length == len(job.emitted) == 1
++    print("verify-job bookkeeping ok (full-accept and immediate-reject windows)")
++
++
++def test_q_sample_determinism():
++    _, logq_raw = _rand_pq(64, 32, seed = 5)
++    a = q_sample(logq_raw, 42)
++    b = q_sample(logq_raw, 42)
++    assert int(a[0]) == int(b[0])
++    # draws stay inside the shaped support
++    support = shaped_q(logq_raw) > -float("inf")
++    for seed in range(50):
++        assert bool(support[int(q_sample(logq_raw, seed)[0])])
++    print("q_sample determinism/support ok")
++
++
++def test_transform_batched_parity():
++    # The batched window transform must equal the per-row 1D transform row for row,
++    # including rep penalty over growing optimistic prefixes (past + d_0..d_{i-1})
++    from exllamav3.generator.spec_sampling import (
++        spec_transform, spec_transform_batched, SpecTransform,
++    )
++    g = torch.Generator().manual_seed(7)
++    vocab, w, past_len = 512, 4, 300
++    logits = torch.randn(w, vocab, generator = g)
++    past_full = torch.randint(0, vocab, (past_len,), generator = g)
++    drafts = torch.randint(0, vocab, (w,), generator = g)
++    specs = [
++        SpecTransform(temperature = 0.6, top_k = 20, top_p = 0.95, temp_first = True),
++        SpecTransform(temperature = 0.8, top_k = 50, top_p = 0.9, temp_first = False,
++                      rep_p = 1.1, sustain_range = 128, decay_range = 64),
++        SpecTransform(rep_p = 1.05, sustain_range = 256, decay_range = 0),
++    ]
++    for spec in specs:
++        pasts = [torch.cat((past_full, drafts[:i])) for i in range(w)]
++        ref = torch.stack([spec_transform(logits[i], pasts[i], spec) for i in range(w)])
++        bat = spec_transform_batched(logits, pasts, spec)
++        assert torch.allclose(ref, bat, atol = 1e-6), f"batched transform diverges: {spec}"
++
++        # The rep penalty reads only the last sustain+decay+1 past tokens: slicing the
++        # past tail preserves the transform exactly (this is what the verifier captures)
++        if spec.rep_p != 1.0:
++            tail = pasts[-1][-(spec.sustain_range + spec.decay_range + 1):]
++            ref_full = spec_transform(logits[-1], pasts[-1], spec)
++            ref_tail = spec_transform(logits[-1], tail, spec)
++            assert torch.allclose(ref_full, ref_tail, atol = 1e-6), "tail slice changes p"
++    print("batched transform parity + tail-slice exactness ok")
++
++
++if __name__ == "__main__":
++    torch.manual_seed(0)
++    test_residual_edge_cases()
++    test_q_sample_determinism()
++    test_verify_job_bookkeeping()
++    test_transform_batched_parity()
++    test_emitted_distribution_exact()
++    print("all spec-sampling CPU gates passed")
+diff --git a/tests/test_spec_transform_parity.py b/tests/test_spec_transform_parity.py
+new file mode 100644
+index 0000000..eb74111
+--- /dev/null
++++ b/tests/test_spec_transform_parity.py
+@@ -0,0 +1,318 @@
++import sys, os
++sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++import math
++import random
++import torch
++
++import exllamav3.generator.sampler.custom as sampler_custom
++from exllamav3.generator.sampler.custom import (
++    CustomSampler,
++    SamplingState,
++    SS_RepP,
++    SS_Temperature,
++    SS_TopK,
++    SS_TopP,
++    SS_MinP,
++    SS_Sample,
++)
++from exllamav3.generator.spec_sampling import extract_spec, spec_transform
++
++"""
++Parity test for spec_transform (M1 shadow mode, docs/spec_sampling.md §8.1): the
++standalone target-side transform must reproduce the distribution of the executed sampler
++stack. Reference is the discrete step stack (fusion disabled), sampled hundreds of
++thousands of times; the empirical token frequencies are compared against the theoretical
++spec_transform distribution with a chi-square statistic over the support.
++
++Runs on cuda (the rep-penalty reference is a CUDA kernel) with small tensors. Standalone:
++
++    python tests/test_spec_transform_parity.py
++"""
++
++device = "cuda:0"
++
++
++def empirical_counts(sampler, logits, n_samples, batch):
++    counts = torch.zeros(logits.shape[-1], dtype = torch.long, device = device)
++    lb = torch.empty((batch, logits.shape[-1]), dtype = logits.dtype, device = device)
++    done = 0
++    while done < n_samples:
++        # Sampler steps can transform their input in place (fp32 temperature), so every
++        # draw starts from a fresh copy of the reference logits
++        lb.copy_(logits)
++        rand_u32 = random.randrange(0, 1 << 32)
++        s = sampler.forward(lb, None, rand_u32, None)
++        counts += torch.bincount(s.view(-1), minlength = logits.shape[-1])
++        done += batch
++    return counts
++
++
++def apply_rep_penalty_ref(rep_step, logits, past_ids):
++    # The rep-penalty kernel is bsz-1 only, so the reference applies the real SS_RepP
++    # step once up front (it is deterministic given logits + past) and batch-samples the
++    # remaining tail below — an exact reference for the full stack
++    state = SamplingState(
++        rand_u32 = 0, bsz = 1, dim = logits.shape[-1],
++        in_logits = logits.view(1, -1), past_ids = past_ids,
++    )
++    rep_step.run(state)
++    return state.logits.view(-1)
++
++
++def check_case(name, steps, vocab, n_samples, batch, past_len, seed):
++    # Discrete reference stack (fusion disabled); restored after construction
++    prev = sampler_custom.fused_sampler_enable
++    sampler_custom.fused_sampler_enable = False
++    try:
++        sampler = CustomSampler(steps)
++        rep_step = steps[0] if type(steps[0]) is SS_RepP else None
++        tail_sampler = CustomSampler(steps[1:] if rep_step is not None else steps)
++    finally:
++        sampler_custom.fused_sampler_enable = prev
++
++    spec = extract_spec(sampler)
++    assert spec is not None, f"{name}: stack should be in the supported subset"
++
++    torch.manual_seed(seed)
++    random.seed(seed)
++    logits = (torch.randn(vocab, device = device) * 3.0).half()
++    past = torch.randint(0, vocab, (1, past_len), device = device)
++
++    ref_logits = apply_rep_penalty_ref(rep_step, logits, past) if rep_step is not None else logits
++    counts = empirical_counts(tail_sampler, ref_logits, n_samples, batch)
++
++    logp = spec_transform(logits, past, spec)
++    p = logp.exp().double()
++    assert abs(p.sum().item() - 1.0) < 1e-3, f"{name}: p not normalized: {p.sum().item()}"
++
++    support = p > 0
++    n_support = int(support.sum())
++    outside = int(counts[~support].sum())
++    assert outside == 0, f"{name}: {outside} samples outside the theoretical support"
++
++    pc = p[support]
++    pc = pc / pc.sum()
++    cc = counts[support].double()
++    expected = pc * n_samples
++    # Bins with negligible expectation make Pearson's statistic invalid; evaluate on the
++    # well-populated bins, renormalized (the outside-support check above covers the rest)
++    big = expected >= 5.0
++    pb = pc[big]
++    pb = pb / pb.sum()
++    cb = cc[big]
++    nb = cb.sum()
++    eb = pb * nb
++    chi2 = float(((cb - eb) ** 2 / eb).sum())
++    df = int(big.sum()) - 1
++    emp = cb / cb.sum()
++    kl = float((pb * (pb.log() - emp.clamp(min = 1e-300).log())).sum())  # KL(theory || empirical)
++    tv = float((pb - emp).abs().sum() / 2)
++
++    limit = df + 6.0 * math.sqrt(2.0 * df)
++    print(
++        f"{name}: n={n_samples} support={n_support} bins={int(big.sum())} "
++        f"chi2={chi2:.1f} df={df} chi2/df={chi2 / max(df, 1):.3f} "
++        f"KL(theo||emp)={kl:.2e} TV={tv:.2e} (limit chi2<{limit:.1f})"
++    )
++    assert chi2 < limit, f"{name}: chi-square {chi2:.1f} exceeds {limit:.1f}"
++    assert kl < 2e-3, f"{name}: KL {kl} too large"
++
++
++def test_parity_deployed_preset():
++    # Live preset: temp 0.6 / top_p 0.95 / top_k 20 / rep_penalty 1.05, temp-first
++    check_case(
++        "deployed(temp0.6,topp0.95,topk20,repp1.05,decay)",
++        [SS_RepP(1.05, 2048, 512), SS_Temperature(0.6), SS_TopK(20), SS_TopP(0.95), SS_Sample()],
++        vocab = 32768, n_samples = 200_000, batch = 1024, past_len = 3000, seed = 1234,
++    )
++
++
++def test_parity_temp_last():
++    check_case(
++        "temp-last(topk50,topp0.9,temp0.8,repp1.1)",
++        [SS_RepP(1.1, 100000, 0), SS_TopK(50), SS_TopP(0.9), SS_Temperature(0.8), SS_Sample()],
++        vocab = 32768, n_samples = 100_000, batch = 1024, past_len = 500, seed = 5678,
++    )
++
++
++def test_parity_temperature_only():
++    check_case(
++        "temperature-only(temp0.7)",
++        [SS_Temperature(0.7), SS_Sample()],
++        vocab = 16384, n_samples = 200_000, batch = 1024, past_len = 0, seed = 42,
++    )
++
++
++def test_extract_spec_fused_matches_discrete():
++    # The same stack fused (default) must extract the same spec as the discrete form
++    def build():
++        return CustomSampler([SS_RepP(1.05, 2048, 512), SS_Temperature(0.6),
++                              SS_TopK(20), SS_TopP(0.95), SS_Sample()])
++
++    prev = sampler_custom.fused_sampler_enable
++    try:
++        sampler_custom.fused_sampler_enable = True
++        fused_spec = extract_spec(build())
++        sampler_custom.fused_sampler_enable = False
++        disc_spec = extract_spec(build())
++    finally:
++        sampler_custom.fused_sampler_enable = prev
++    assert fused_spec is not None and disc_spec is not None
++    for f in ("temperature", "top_k", "top_p", "temp_first", "rep_p", "sustain_range", "decay_range"):
++        a, b = getattr(fused_spec, f), getattr(disc_spec, f)
++        assert a == b or math.isclose(a, b), f"fused {fused_spec} != discrete {disc_spec} (field {f})"
++
++    # temp-last form
++    prev = sampler_custom.fused_sampler_enable
++    try:
++        sampler_custom.fused_sampler_enable = True
++        s = extract_spec(CustomSampler([SS_TopK(50), SS_TopP(0.9), SS_Temperature(0.8), SS_Sample()]))
++    finally:
++        sampler_custom.fused_sampler_enable = prev
++    assert s is not None and not s.temp_first and abs(s.temperature - 0.8) < 1e-6
++    assert s.top_k == 50 and abs(s.top_p - 0.9) < 1e-6
++    print("extract_spec fused/discrete parity ok")
++
++
++def test_extract_spec_unsupported():
++    prev = sampler_custom.fused_sampler_enable
++    try:
++        for fused in (True, False):
++            sampler_custom.fused_sampler_enable = fused
++            # min_p is outside the v1 subset
++            assert extract_spec(CustomSampler([SS_Temperature(0.6), SS_MinP(0.1), SS_Sample()])) is None
++            # pure argmax (greedy) is degenerate -> legacy
++            from exllamav3.generator.sampler.custom import SS_Argmax
++            assert extract_spec(CustomSampler([SS_TopK(20), SS_Argmax()])) is None
++    finally:
++        sampler_custom.fused_sampler_enable = prev
++    print("extract_spec unsupported-stack fallbacks ok")
++
++
++def test_transform_deterministic():
++    # Hand-computed transforms (CPU, no kernels): pins the exact top_k/top_p threshold
++    # semantics (position 0 always kept; token kept while cumsum <= top_p), temperature
++    # placement and the rep-penalty mirror against known values
++    from exllamav3.generator.spec_sampling import SpecTransform
++
++    ni = -float("inf")
++
++    # top_k then top_p: cumsum including the token must stay <= top_p
++    logits = torch.tensor([4.0, 3.0, 2.0, 1.0, 0.0, -1.0])
++    logp = spec_transform(logits, None, SpecTransform(top_k = 3, top_p = 0.9))
++    # softmax([4,3,2]) = [0.6652, 0.2447, 0.0900]; cumsum[1] = 0.9099 > 0.9 -> only token 0
++    expect = torch.tensor([0.0, ni, ni, ni, ni, ni])
++    assert torch.equal(logp, expect), f"top_k/top_p: {logp}"
++
++    # temp-first: filters see the tempered distribution
++    logits = torch.tensor([2.0, 1.0, 0.0])
++    logp = spec_transform(logits, None, SpecTransform(temperature = 2.0, top_p = 0.85, temp_first = True))
++    # tempered [1, 0.5, 0]: cumsum = [0.5065, 0.8137, 1.0] -> drop last, renorm over first two
++    expect = torch.log_softmax(torch.tensor([1.0, 0.5, ni]), dim = -1)
++    assert torch.allclose(logp, expect), f"temp-first: {logp} vs {expect}"
++
++    # temp-last: filters see the untempered distribution
++    logp = spec_transform(logits, None, SpecTransform(temperature = 2.0, top_p = 0.85, temp_first = False))
++    # untempered cumsum = [0.6652, 0.9099, 1.0] -> keep only token 0
++    expect = torch.tensor([0.0, ni, ni])
++    assert torch.equal(logp, expect), f"temp-last: {logp}"
++
++    # rep penalty mirror: positive logits divided, negative multiplied, non-past untouched
++    logits = torch.tensor([2.0, -2.0, 4.0])
++    past = torch.tensor([0, 1])
++    logp = spec_transform(logits, past, SpecTransform(rep_p = 2.0, sustain_range = 1000, decay_range = 0))
++    expect = torch.log_softmax(torch.tensor([1.0, -4.0, 4.0]), dim = -1)
++    assert torch.allclose(logp, expect, atol = 1e-6), f"rep_p: {logp} vs {expect}"
++
++    print("deterministic transform checks ok")
++
++
++def test_shadow_observe_smoke():
++    # Drives Generator._spec_shadow_observe with stub jobs. Covers the two failure modes
++    # seen outside the stub world: (a) sequence_ids.torch() is (1, seq_len) — 2D, the same
++    # shape the live sampler gets as past_ids — and the draft continuation must align with
++    # it for positions past the legacy cut; (b) any exception inside the observation must
++    # be contained (rate-limited warning, window skipped), never propagated into
++    # generation.
++    import logging
++    from types import SimpleNamespace
++    from exllamav3.generator.generator import Generator, logger
++    from exllamav3.generator.sampler.custom import SS_Fused
++
++    infos, warnings = [], []
++    class H(logging.Handler):
++        def emit(self, r):
++            (warnings if r.levelno >= logging.WARNING else infos).append(r.getMessage())
++    h = H()
++    logger.addHandler(h)
++    logger.setLevel(logging.INFO)
++    try:
++        vocab, window = 64, 3
++        device = "cuda:0" if torch.cuda.is_available() else "cpu"
++
++        def make_job(seq_ids_obj):
++            return SimpleNamespace(
++                sequences = [SimpleNamespace(sequence_ids = seq_ids_obj)],
++                filters = [], forced_ids = None, return_probs = False, return_top_tokens = 0,
++                device_logit_mask = None, new_tokens = 1,
++                sampler = SimpleNamespace(steps = [SS_Fused(SS_Fused.MODE_SAMPLE, 1.0)]),
++            )
++
++        class FakeSeqIds:
++            def torch(self): return torch.zeros((1, 10), dtype = torch.long)  # real 2D shape
++
++        g = SimpleNamespace(
++            active_jobs = [make_job(FakeSeqIds())],
++            _spec_shadow_stats = None, _spec_shadow_errors = 0, _spec_shadow_diag = False,
++            tokenizer = SimpleNamespace(actual_vocab_size = vocab),
++        )
++        # The real Generator has this as a method; the wrapper calls it on self
++        g._spec_shadow_observe_inner = Generator._spec_shadow_observe_inner.__get__(g)
++        batch_logits = torch.randn(1, window + 1, vocab, device = device)
++        draft_tokens = torch.zeros(1, window, dtype = torch.long)
++        # accepted_length = 1 -> k = 0, so positions 1..window-1 take the cat path
++        for _ in range(120):
++            g._spec_shadow_logq = [
++                torch.log_softmax(torch.randn(1, 32, device = device), dim = -1)
++                for _ in range(window)
++            ]
++            Generator._spec_shadow_observe(g, batch_logits, draft_tokens, [0, 1], [1], set())
++        # one startup diagnostic, then two wrap-safe records per 50 windows
++        assert len(infos) == 5, infos
++        assert infos[0].startswith("spec-shadow: first observe"), infos[0]
++        assert infos[1].startswith("spec-shadow-i w=50 "), infos[1]
++        assert infos[2].startswith("spec-shadow-t w=50 "), infos[2]
++        assert infos[3].startswith("spec-shadow-i w=50 "), infos[3]
++        assert infos[4].startswith("spec-shadow-t w=100 "), infos[4]
++        # every periodic record must fit TabbyAPI's ~56-char wrap budget on one line
++        for line in infos[1:]:
++            assert len(line) <= 56, f"record too long, would be wrapped: {line}"
++
++        # Exception containment: a job whose state access raises is skipped with a
++        # rate-limited warning; nothing propagates, stats are untouched
++        class BadSeqIds:
++            def torch(self): raise RuntimeError("boom")
++        g.active_jobs = [make_job(BadSeqIds())]
++        g._spec_shadow_logq = [
++            torch.log_softmax(torch.randn(1, 32, device = device), dim = -1)
++            for _ in range(window)
++        ]
++        stats_before = dict(g._spec_shadow_stats)
++        Generator._spec_shadow_observe(g, batch_logits, draft_tokens, [0, 1], [1], set())
++        assert g._spec_shadow_errors == 1
++        assert len(warnings) == 1 and "spec-shadow" in warnings[0] and "boom" in warnings[0], warnings
++        assert g._spec_shadow_stats["windows"] == stats_before["windows"]
++    finally:
++        logger.removeHandler(h)
++    print("shadow observe smoke ok")
++
++
++if __name__ == "__main__":
++    test_transform_deterministic()
++    test_extract_spec_fused_matches_discrete()
++    test_extract_spec_unsupported()
++    test_shadow_observe_smoke()
++    test_parity_deployed_preset()
++    test_parity_temp_last()
++    test_parity_temperature_only()
++    print("all spec_transform parity checks passed")

@@ -1,0 +1,43 @@
+From b8c0497ce6c1a88e9cb117809b8337c91780a789 Mon Sep 17 00:00:00 2001
+From: xujie <xujie@local>
+Date: Mon, 28 Sep 2026 14:25:31 +0800
+Subject: [PATCH] local: allow max_history bump under EXL3_HYBRID_NGRAM
+
+---
+ backends/exllamav3/model.py | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/backends/exllamav3/model.py b/backends/exllamav3/model.py
+index a377598..2936601 100644
+--- a/backends/exllamav3/model.py
++++ b/backends/exllamav3/model.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import gc
++import os
+ import pathlib
+ import re
+ import time
+@@ -721,10 +722,17 @@ class ExllamaV3Container:
+             default_draft_tokens = 4
+         else:
+             default_draft_tokens = 0
++        # M3 hybrid ngram+MTP drafting (EXL3_HYBRID_NGRAM): the ngram verify window runs
++        # past draft_num_tokens, and recurrent state history (GDN conv/state buffers) must
++        # cover it
++        _hybrid_max = 0
++        if os.environ.get("EXL3_HYBRID_NGRAM", "0") != "0":
++            _hybrid_max = int(os.environ.get("EXL3_NGRAM_MAX_DRAFT", "7"))
+         batch_draft_args = {
+             "max_batch_size": self.max_batch_size,
+-            "max_history": (
+-                self.draft_num_tokens if self.draft_num_tokens is not None else default_draft_tokens
++            "max_history": max(
++                self.draft_num_tokens if self.draft_num_tokens is not None else default_draft_tokens,
++                _hybrid_max,
+             ),
+         }
+ 
+-- 
+2.43.0
+

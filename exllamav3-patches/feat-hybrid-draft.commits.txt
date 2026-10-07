@@ -1,0 +1,23 @@
+c5de62d 2026-09-28 xujie feat(hc_mix): EXL3_GR_TUNED cooperative fused GR mix kernel (R <= 4)
+deab4d3 2026-09-28 xujie test(m4): decode floor profiling scripts (traces gitignored)
+6d3a91a 2026-09-28 xujie docs: M3 measured results (w=7 + adaptive vs MTP-only baseline)
+ab5671a 2026-09-28 xujie fix(generator): default EXL3_NGRAM_MAX_DRAFT to 7 — forward kernel cliff at q_len>8
+d11d060 2026-09-28 xujie feat(generator): per-job adaptive ngram backoff (EXL3_NGRAM_ADAPTIVE)
+c902ead 2026-09-28 xujie fix(generator): clamp hybrid ngram width to cache max_history
+b5c941d 2026-09-28 xujie docs: M3 hybrid ngram+MTP drafting design
+e3964f9 2026-09-28 xujie test(spec): hybrid draft CPU gates
+54b0072 2026-09-28 xujie feat(generator): M3 hybrid ngram+MTP drafting (EXL3_HYBRID_NGRAM)
+983f1aa 2026-09-28 xujie docs: review round 2 — M2 live debugging (metric basis, window economics, adaptive engagement)
+f5ab02e 2026-09-28 xujie test(spec): batched transform parity and rep-penalty tail-slice gates
+4807547 2026-09-28 xujie fix(generator): M2 live debug — window cap, batched optimistic verify, tested-basis shadow, adaptive engagement
+35d04a2 2026-09-28 xujie test(spec): CPU gates for exact spec sampling
+8fd59de 2026-09-28 xujie feat(generator): EXL3_SPEC_SAMPLING exact speculative verify path
+5e52ac9 2026-09-28 xujie feat(sampler): spec-path primitives (job_spec, q_sample, spec_accept, spec_residual_probs)
+488e5f8 2026-09-28 xujie feat(generator): wrap-safe spec-shadow records, window subsampling, startup diag
+7757222 2026-09-28 xujie fix(generator): contain spec-shadow failures and fix past-ids dims
+ed04008 2026-09-27 xujie feat(generator): per-interval stats in spec-shadow log lines
+4b8ab82 2026-09-27 xujie test(spec): spec_transform parity vs the discrete sampler stack
+fe20eac 2026-09-27 xujie feat(generator): EXL3_SPEC_SHADOW observe-only spec-acceptance measurement
+19de191 2026-09-27 xujie feat(sampler): spec_transform/extract_spec core for exact spec sampling (M1)
+34b745e 2026-09-27 xujie docs: review round 1 — fused-stack transform, MTP state carry, q shaping
+d26bb26 2026-09-27 xujie docs: design for exact speculative sampling of MTP drafts
