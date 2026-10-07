@@ -101,14 +101,18 @@ census is what would settle it, and it is the gate on a real kernel project.
 
 ## 6. Beyond engine knobs
 
-The upstream README lists what the per-stream numbers do not cover, and one item is measurable
-here now:
+The upstream README lists what the per-stream numbers do not cover. Two of those items are now
+measured — see **[exllamav3-tabbyapi-benchmark.md](exllamav3-tabbyapi-benchmark.md)**:
 
-- **TabbyAPI throughput on the current pin had not been re-measured.** The published per-stream
-  numbers are `chat.py` and the concurrency table is stock 1.5.0 at k=3. The paired numbers in
-  `env.sh`'s `EXL3_MTP_HEAD_N` comment (68.7 code / 48.8 prose at 400 tokens, in-process, full GB10
-  env) and the prefill figures (825 tok/s @8k rising to ~1030 by 64k, fixed cost ≈2.2 s with the
-  n-gram table on NVMe) are that measurement for the in-process path. Server-side is still open.
+- **TabbyAPI throughput on the current pin is measured.** Server-side, single stream, 400 tokens:
+  **60.2 tok/s mean with thinking off** (73.4 peak on code) and **53.3 with thinking on** (xhigh).
+  Thinking costs ~11% and the mechanism is draft acceptance, not per-token work — code acceptance
+  falls 85% → 61% because reasoning text is harder for the MTP head to predict. On the real workload
+  the log gives a median of **54.4 tok/s** with a 78.8 peak.
+- **The concurrency picture is measured too.** A client that reported ~29 tok/s was reading the
+  per-stream rate at ~4 concurrent jobs (upstream's table gives 104.4 aggregate / **26.1 per
+  stream**), and the log shows the slowest requests all overlapped one 265-second generation. That
+  is queue throughput, not a regression.
 
 - **Prefix-cache hit rate is a user-visible lever larger than most kernel work.** Cache reuse is
   strict-prefix; a client that rewrites its context (compaction, or a timestamp/random id in the
