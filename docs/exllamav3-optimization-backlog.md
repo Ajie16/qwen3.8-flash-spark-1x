@@ -66,7 +66,7 @@ Not an engine variable at all — TabbyAPI's `chunk_size`, passed through as the
 | 16384 | — | — | refused by the autosplit headroom check |
 
 **+14% prefill, decode unchanged, +2 GiB.** Two independent runs agree (1116–1129, 1116–1154).
-16384 needs memory freed (`NGRAM_RAM=false` releases 18 GiB) before it will load.
+16384 needs memory freed before it will load, and `NGRAM_RAM=false` is **not** the way to do it - it releases the 18 GiB but costs 8-33% of decode (see section 3).
 
 Note it is *also* `max_rq_tokens`:
 
@@ -120,6 +120,7 @@ launcher's configuration. Reproduced here so nobody spends the days twice.
 | N-gram assist alongside MTP, in shipped code | **Mutually exclusive** — `Generator` asserts `not ngram_match_min` when a draft model is set. `EXL3_HYBRID_NGRAM` on the worktree is what lifts this |
 | `EXL3_QC_PREFILL_NS` | **Not a lever — the engine self-tunes it.** `_pick_qc_prefill_num_stages` compiles and warms up both 2-stage and 1-stage on the first prefill per kernel family, then caches the winner. Upstream notes the span is −75%..+85% with no usable static rule and that 4090/5090 disagree per point |
 | `EXL3_QC_STAGING=2` | A/B/debug mode (dequantise-then-attend with full-size fp16 temporaries). Default 1 is the fast path |
+| `NGRAM_RAM=false` | **Costs decode, and it is the obvious way to afford a bigger `CHUNK_SIZE`** — so it is worth knowing why it does not. The 18 GiB table is the PLE (per-layer embedding) table, a **model layer used on every forward, decode included**, not a drafting aid; streaming it sets `mode = "trellis_disk"` and issues a synchronous row gather per forward, overlapped by a prefetch worker that does not fully hide the latency. Measured at `CHUNK_SIZE` 8192, four content types, 500 tokens: decode mean **51.9 → 35.0 (−33%)**, split as −49% and −62% on the first two requests (cold page cache) and about −8% on the later two. Prefill median unchanged (1,132 vs 1,145) with one rep at 732. **Trading −8%..−33% of decode for +14% of prefill does not pay**, so 16384 is closed unless memory is freed another way |
 
 ---
 
