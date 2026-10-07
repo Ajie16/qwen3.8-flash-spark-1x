@@ -1,0 +1,72 @@
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index b964cf0..09b21c8 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -24,6 +24,14 @@ from ..tokenizer import MMEmbedding
+ from ..util import profile_opt
+ 
+ import os as _os
++import sys
++
++# EXL3_LOG_ROUNDS=1 prints one line per draft+verify round to stderr. Off by default; read once at
++# import like the other switches here. Used to localise a slow round when a request's average tok/s
++# cannot say whether acceptance fell, the verify forward slowed, or the engine stalled outside the
++# loop.
++_LOG_ROUNDS = _os.environ.get("EXL3_LOG_ROUNDS", "0") != "0"
++_ROUND_N = [0]
+ import math as _math
+ _BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
+ _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
+@@ -685,19 +693,52 @@ class Generator:
+             self.recurrent_checkpoint()
+ 
+         # Generation with draft model
++        draft_tokens = None
++        _rd = None
++        if _LOG_ROUNDS:
++            _rd = {
++                "t0": time.perf_counter(),
++                "acc": sum(getattr(j, "accepted_draft_tokens", 0) for j in self.active_jobs),
++                "rej": sum(getattr(j, "rejected_draft_tokens", 0) for j in self.active_jobs),
++            }
+         if self.draft_model:
+             if self.dflash_draft:
+                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
++                if _rd is not None:
++                    _rd["t1"] = time.perf_counter()
+                 self.iterate_gen(results, draft_tokens)
+             elif self.mtp_draft:
+                 if self.hybrid_ngram:
+                     draft_tokens = self.iterate_hybrid_gen(results)
+                 else:
+                     draft_tokens = self.iterate_draftmodel_mtp_gen(results)
++                if _rd is not None:
++                    _rd["t1"] = time.perf_counter()
+                 self.iterate_gen(results, draft_tokens)
+             else:
+                 draft_tokens = self.iterate_draftmodel_gen(results)
++                if _rd is not None:
++                    _rd["t1"] = time.perf_counter()
+                 self.iterate_gen(results, draft_tokens)
++        if _rd is not None:
++            _rd["t2"] = time.perf_counter()
++            _rq_acc = sum(getattr(j, "accepted_draft_tokens", 0) for j in self.active_jobs)
++            _rq_rej = sum(getattr(j, "rejected_draft_tokens", 0) for j in self.active_jobs)
++            _rq_win = 0
++            try:
++                if draft_tokens is not None:
++                    _rq_win = int(draft_tokens.shape[1])
++            except Exception:
++                _rq_win = -1
++            _ROUND_N[0] += 1
++            print(
++                f"[round] n={_ROUND_N[0]} jobs={len(self.active_jobs)} window={_rq_win} "
++                f"draft_ms={1000 * (_rd.get('t1', _rd['t0']) - _rd['t0']):.1f} "
++                f"verify_ms={1000 * (_rd['t2'] - _rd.get('t1', _rd['t0'])):.1f} "
++                f"total_ms={1000 * (_rd['t2'] - _rd['t0']):.1f} "
++                f"acc=+{_rq_acc - _rd['acc']} rej=+{_rq_rej - _rd['rej']}",
++                file=sys.stderr, flush=True,
++            )
+ 
+         # Generation with n-gram draft
+         elif self.ngram_match_min:
