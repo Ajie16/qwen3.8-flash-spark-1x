@@ -7,6 +7,17 @@ EXL3_REPO="${EXL3_REPO:-https://github.com/vcruz305/exllamav3.git}"
 EXL3_REF="${EXL3_REF:-94ba01d50a13fa9ff672473f2d0eef8b51a71e99}"
 EXL3_MIN_VERSION="${EXL3_MIN_VERSION:-1.5.1}"
 
+# Optional second checkout to load INSTEAD of EXL3_SRC. `feat/hybrid-draft` carries kernels master
+# does not have -- EXL3_GR_TUNED, EXL3_HYBRID_NGRAM, EXL3_NGRAM_ADAPTIVE, EXL3_SPEC_SAMPLING -- plus
+# its own exllamav3_ext*.so built with the fused GR kernel. Master's .so does NOT contain it
+# (`strings exllamav3_ext*.so | grep -c EXL3_GR_TUNED` is 1 there, 0 here), so EXL3_GR_TUNED=1
+# against master is silently a no-op. Setting this puts the worktree ahead of the venv's editable
+# .pth on sys.path, so both the package and the extension resolve there. Empty = run master alone.
+EXL3_SPEC_SRC="${EXL3_SPEC_SRC:-}"
+if [[ -n "$EXL3_SPEC_SRC" ]]; then
+  export PYTHONPATH="$EXL3_SPEC_SRC${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 # The API server: latest theroyallab/tabbyAPI main, deliberately not pinned.
 TABBY_REPO="${TABBY_REPO:-https://github.com/theroyallab/tabbyAPI.git}"
 TABBY_REF="${TABBY_REF:-main}"
@@ -28,8 +39,29 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 export EXL3_INT8_GEMV="${EXL3_INT8_GEMV:-0}"          # fp16 GEMV beats the int8-activation one on GB10 (+3)
 export EXL3_MOE_COOP_WIDE="${EXL3_MOE_COOP_WIDE:-1}"  # wide 128-col MoE coop tile on 48 SMs (+5)
 export EXL3_GR_INT8="${EXL3_GR_INT8:-1}"              # int8 hyperconnection mixers (+5 code, +7 DevOps)
-export EXL3_MTP_HEAD_N="${EXL3_MTP_HEAD_N:-65536}"    # pruned draft lm_head slice
+# Pruned draft lm_head slice. 65536 is the upstream default and the recipe's value, but that slice
+# covers only 56.8% of a Chinese-weighted draft vocabulary and 0% of the 410 high-frequency Chinese
+# ids a corpus audit turned up; at 65536 Chinese prose draft acceptance collapses to 10.8% and
+# drafting is then SLOWER than not drafting at all (33.1 vs 39.7 tok/s). 163840 reaches 98.0% /
+# 99.3% and costs 52 MB more head. Paired same-session A/B, full GB10 env, ndt=5 -dds -dc 0.6:
+#
+#   load           65536              163840            131072
+#   code (EN)      68.8 / 65.4%       68.7 / 67.2%      68.7 / 67.2%
+#   prose (EN)     50.4 / 45.3%       48.8 / 45.8%      49.3 / 45.8%
+#   zh code        53.5 / 45.3%       67.9 / 67.2%      67.1 / 65.5%
+#   zh prose       33.1 / 10.8%       64.8 / 40.3%      52.5 / 38.6%
+#
+# English is flat within noise; Chinese prose doubles. 131072 sits at the best marginal coverage per
+# MB on a Chinese-id proxy but loses 25% of the corpus-410 ids and measures 18.5% slower on zh prose,
+# so 163840 is the choice. Above 163840 the marginal return is ~0.01 coverage/MB; stop there.
+export EXL3_MTP_HEAD_N="${EXL3_MTP_HEAD_N:-163840}"
 export EXL3_DRAFT_CONFIDENCE="${EXL3_DRAFT_CONFIDENCE:-0.6}"  # dynamic-draft target (+8 prose vs 0.4)
+# Fused cooperative GR mix kernel (dots + finalize in one launch, grid.sync, L2 prefetch). Needs
+# EXL3_SPEC_SRC above, or it is a no-op. Gated internally to R <= 4 and D % 16 == 0; nsys shows the
+# GR pair runs at R = 1..6 with R <= 4 covering ~86% of calls, and R >= 5 deliberately keeps the
+# stock pair. Microbench us/site stock -> fused: R1 39.9 -> 34.0, R2 40.8 -> 37.5, R3 43.9 -> 43.1,
+# R4 55.3 -> 50.8. Reassociated but deterministically ordered, so run-to-run bit stable.
+export EXL3_GR_TUNED="${EXL3_GR_TUNED:-1}"
 export TORCH_CUDA_ARCH_LIST CUDA_HOME
 
 # GB10 has 10 Cortex-X925 (big) + 10 A725 (little); pin to the big ones (+2). Empty disables.

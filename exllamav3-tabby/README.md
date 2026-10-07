@@ -373,6 +373,19 @@ README (`max-num-seqs`, CUDA graph mode, batched-token size, fp8 KV).
 
 #### The native engine, tuned for GB10
 
+**`EXL3_MTP_HEAD_N` is 163840 here, not the default 65536.** The knob's own rationale above was
+measured on English and code, where a 64K slice really does catch ~97% of drafts. It does not hold
+for Chinese: the high-frequency Chinese ids sit above the slice, and a draft that can never propose
+them is a guaranteed rejection. Raising it is free on English and roughly doubles Chinese prose.
+Full numbers and the 131072 comparison are in
+[`../docs/exllamav3-optimization-backlog.md`](../docs/exllamav3-optimization-backlog.md) and in the
+knob's comment in [`env.sh`](env.sh).
+
+**Running it.** [`serve-local.sh`](serve-local.sh) is the launcher for this box: it pins the
+uncensored pack (`MODEL_DIR`), the `feat/hybrid-draft` worktree (`EXL3_SPEC_SRC`, needed for
+`EXL3_GR_TUNED` to exist at all), n-gram tables in RAM, vision on, and the LAN binding. `serve.sh`
+alone will start, but it defaults to master, the censored pack and vision off.
+
 The numbers above ran exllamav3 1.5.0 with its stock defaults. This is the same
 engine at [vcruz305/exllamav3 `329e051`](https://github.com/vcruz305/exllamav3/commit/329e051)
 (upstream master + the aarch64 guards, [#1](https://github.com/vcruz305/exllamav3/pull/1),
@@ -435,7 +448,7 @@ below.
 | `-ndt 5` (from 3) | +8 | the verify forward costs 37 ms at q=2, 52 at q=5, 59 at q=7, 86 at q=9; on code, acceptance stays high enough that 5 is the peak |
 | `-dds -dc 0.6` | ±0 code, **+8 prose** | dynamic draft length; see below |
 | `EXL3_GR_INT8=1` | **+5 code, +7 DevOps, +4 prose** | the hyperconnection mixer weights stored int8 instead of fp16; see below |
-| `EXL3_MTP_HEAD_N=65536` | ±2 | draft argmax over a 64K-column slice of `lm_head` (105 MB) instead of the full 248K head (397 MB); 97% of drafts land in-slice, misses become rejections, verify still uses the full head. Worth 5 ms/round in-process; inside variance through `chat.py` |
+| `EXL3_MTP_HEAD_N=163840` | ±2 on English | draft argmax over a 160K-column slice of `lm_head` (262 MB) instead of the full 248K head (397 MB); verify still uses the full head, so outputs are unchanged. **The default 65536 is wrong for Chinese**: it reaches only 56.8% of a Chinese-weighted draft vocabulary and *none* of the 410 high-frequency Chinese ids a corpus audit found, which collapses zh-prose draft acceptance to 10.8% and makes drafting slower than not drafting (33.1 vs 39.7 tok/s). 163840 reaches 98.0% / 99.3%. Paired same-session A/B, full GB10 env: zh prose 33.1 → **64.8** tok/s, zh code 53.5 → **67.9**, English code 68.8 → 68.7 and prose 50.4 → 48.8 (noise). Marginal coverage per MB is ~0.01 above 163840, so stop there |
 | `-cq 8,8` | **+3 at 4k, +7 at 240k** | 8-bit KV. The 12 full-attention layers stream the whole KV every decode step, 5.9 GB per step at 240k in fp16; halving it is faster at every depth with acceptance unchanged, and 12 GB less KV at the full context. See below |
 
 Env knobs that measured empty (±2): `EXL3_MOE_COOP_KSPLIT`, `EXL3_GEMV=2`,
