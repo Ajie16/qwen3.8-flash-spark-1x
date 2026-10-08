@@ -18,7 +18,7 @@ import uuid
 
 DEPTHS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "4000,16000,32000,64000").split(",")]
 REPS = int(sys.argv[2]) if len(sys.argv) > 2 else 2
-URL = "http://10.100.64.1:8899/v1/chat/completions"
+URL = "http://10.100.65.1:8899/v1/chat/completions"
 MODEL = "Qwen3.8-Flash-Local"
 
 # ~34 tokens per repetition of this sentence.

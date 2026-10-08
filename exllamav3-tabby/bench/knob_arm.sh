@@ -44,7 +44,7 @@ setsid nohup env "$@" bash exllamav3-tabby/serve-local.sh > "$LOG" 2>&1 < /dev/n
 
 ok=0
 for i in $(seq 1 100); do
-  c=$(curl -s -m 4 -o /dev/null -w "%{http_code}" http://10.100.64.1:8899/health 2>/dev/null || true)
+  c=$(curl -s -m 4 -o /dev/null -w "%{http_code}" http://10.100.65.1:8899/health 2>/dev/null || true)
   [ "$c" = "200" ] && { ok=1; echo "  [$((i*8))s] health=200"; break; }
   sleep 8
 done

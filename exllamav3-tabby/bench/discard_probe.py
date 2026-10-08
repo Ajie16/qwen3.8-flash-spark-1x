@@ -26,7 +26,7 @@ import uuid
 PT = int(sys.argv[1]) if len(sys.argv) > 1 else 20000
 MT = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
 LOG = "/home/xujie/serve-exl3-native.log"
-URL = "http://10.100.64.1:8899/v1/chat/completions"
+URL = "http://10.100.65.1:8899/v1/chat/completions"
 MODEL = "Qwen3.8-Flash-Local"
 
 FILLER = ("本节为工程背景材料，说明分布式存储系统的设计约束，涵盖一致性哈希、虚拟节点、"

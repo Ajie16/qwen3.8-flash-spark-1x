@@ -28,7 +28,7 @@ import uuid
 
 MT = int(sys.argv[1]) if len(sys.argv) > 1 else 4000
 STOP = sys.argv[2] if len(sys.argv) > 2 else "</think>"
-URL = "http://10.100.64.1:8899/v1/chat/completions"
+URL = "http://10.100.65.1:8899/v1/chat/completions"
 MODEL = "Qwen3.8-Flash-Local"
 
 ASK = ("请写一份很长的技术文档，主题是分布式键值存储的一致性哈希与再平衡，"

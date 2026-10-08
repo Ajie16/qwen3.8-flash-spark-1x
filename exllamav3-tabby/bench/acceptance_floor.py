@@ -22,7 +22,7 @@ import uuid
 
 MT = int(sys.argv[1]) if len(sys.argv) > 1 else 500
 LOG = "/home/xujie/serve-exl3-native.log"
-URL = "http://10.100.64.1:8899/v1/chat/completions"
+URL = "http://10.100.65.1:8899/v1/chat/completions"
 MODEL = "Qwen3.8-Flash-Local"
 
 TASKS = {

@@ -20,7 +20,7 @@ import uuid
 
 STREAMS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "1,2,4").split(",")]
 MT = int(sys.argv[2]) if len(sys.argv) > 2 else 400
-URL = "http://10.100.64.1:8899/v1/chat/completions"
+URL = "http://10.100.65.1:8899/v1/chat/completions"
 MODEL = "Qwen3.8-Flash-Local"
 
 ASK = ("Write a Python module implementing a consistent-hash ring with virtual nodes: the ring "

@@ -13,8 +13,18 @@
 #      8k..240k); forcing RAM trades 18 GiB for that back. 88 GiB estimate, fits.
 #   4. VISION=true. The recipe defaults it off. The EXL3 pack's own tower is EXL3-quantised with
 #      split q/k/v, which exllamav3 rejects, so the fork needs the separate BF16 tower.
-#   5. HOST=0.0.0.0 + DISABLE_AUTH=true. Note serve.sh flips DISABLE_AUTH to false automatically
-#      when HOST is not loopback; this is a LAN-trusted box, matching how it was already running.
+#   5. HOST=10.100.65.1 + DISABLE_AUTH=true. Bound to the CX-7 address, so only the peer Spark
+#      (10.100.65.2) can reach the API. 10.100.65.0/24 exists only on enP2p1s0f0np0 as a scope-link
+#      route whose neighbour table holds that one peer, so no other device has a path to it. AxonHub
+#      runs on that peer and forwards here, and it is the only intended entry point - it holds the
+#      API keys, this service holds none. Binding 0.0.0.0 instead would also answer on the
+#      management network, the home network and Tailscale, where any device that knows the address
+#      bypasses AxonHub entirely.
+#
+#      Two things this does NOT do: ip_forward is 1 on this host, so the isolation rests on nobody
+#      having a route into 10.100.65.0/24 rather than on a firewall rule; and the address is
+#      cluster-specific (the head's CX-7 interface), so a different topology needs HOST overridden.
+#      DISABLE_AUTH stays true because the only reachable peer is the trusted one.
 #
 # Everything else (the GB10 kernel knobs, the pruned-head width, the fused GR kernel) comes from
 # env.sh and is documented there with its measurements.
@@ -40,7 +50,7 @@ fi
 export SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Local}"
 export PROFILE="${PROFILE:-concurrent}"
 export NGRAM_RAM="${NGRAM_RAM:-true}"
-export HOST="${HOST:-0.0.0.0}"
+export HOST="${HOST:-10.100.65.1}"
 export DISABLE_AUTH="${DISABLE_AUTH:-true}"
 export VISION="${VISION:-true}"
 
