@@ -165,6 +165,25 @@ cp ~/draft_vocab.engine-0.6.1.txt $T
 
 **④ 换版本后首次启动会重建 CUDA 扩展**（`~/.cache/torch_extensions/py312_cu130/`），加载从 ~70s 涨到 ~100s，且**首轮请求更慢**。
 
+**⑤ 采样已固定为 checkpoint 的推荐值（`tensorfold-mlx/patches/kernel/server_pin_sampling.py.patch`）。**
+
+模型的 `generation_config.json` 推荐 `temperature 1.0 / top_k 20 / top_p 0.95`，而 TensorFold 的
+`App.sampling_for` 原本是客户端优先：
+
+```python
+temp = float(fields.get("temperature", self.sampling["temperature"]))
+```
+
+于是**同一个会话在不同客户端下答案不同**（一个发 greedy、一个发 0.7，比的就不是同一个模型）。
+补丁让 checkpoint 的值胜出，**`seed` 仍归客户端**——它管可复现性，不管分布。
+
+- **生效时机**：改的是 venv 里的文件，**必须重启**才生效（Python 已把模块载入内存）
+- **升级会冲掉它**：`pip install` 覆盖 server.py 后要重跑 `patches/apply_pin_sampling.py`（幂等）
+- **退回开关**：`TENSORFOLD_PIN_SAMPLING=0`（**服务端环境变量，客户端够不着**，需要 greedy 的基准测试用得上）
+
+**注意种子是按 prompt 推导的**（`seed_for(prompt)`），所以**即使 temperature 1.0，同一 prompt 重发也逐字相同**。
+这对 agent 是好事（行为稳定、可缓存），代价是没有多样性——想测方差必须换 prompt。
+
 ---
 
 ## 六、两条路线

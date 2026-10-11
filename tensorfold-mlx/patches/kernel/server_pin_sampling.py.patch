@@ -1,0 +1,55 @@
+--- /home/xujie/server.py.pre-pin	2026-10-11 09:23:03.404968456 +0800
++++ /home/xujie/tensorfold-venv/lib/python3.12/site-packages/tensorfold/cuda/server.py	2026-10-11 09:23:03.421278703 +0800
+@@ -4,6 +4,7 @@
+ import hashlib
+ import inspect
+ import json
++import os
+ import threading
+ import time
+ import uuid
+@@ -39,6 +40,13 @@
+ 
+ _SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "seed")
+ 
++# Serve the checkpoint's own recommended sampling instead of whatever a client sends. The pack's
++# generation_config.json pins temperature 1.0 / top_k 20 / top_p 0.95; a client asking for greedy or
++# 0.7 otherwise changes the model silently, so one conversation answers differently per client.
++# TENSORFOLD_PIN_SAMPLING=0 restores the per-request behaviour (server-side only, so benchmarks that
++# want greedy can have it and clients cannot).
++PIN_SAMPLING = os.environ.get("TENSORFOLD_PIN_SAMPLING", "1") != "0"
++
+ 
+ @dataclass(slots=True)
+ class PreparedRequest:
+@@ -377,18 +385,25 @@
+         return prepared
+ 
+     def sampling_for(self, body: dict[str, Any], prompt: list[int]):
+-        """Keyed sampling (the seed, else one drawn from the prompt), or None for greedy; RequestError if malformed."""
++        """Keyed sampling (the seed, else one drawn from the prompt), or None for greedy; RequestError if malformed.
++        The distribution is the checkpoint's while PIN_SAMPLING holds; the seed is still the request's."""
+ 
+         from tensorfold.engine.exact_sampling import Sampling, seed_for
+ 
+         fields = parse_numbers({k: body[k] for k in _SAMPLING_FIELDS if body.get(k) is not None})
+-        temp = float(fields.get("temperature", self.sampling["temperature"]))
++        if PIN_SAMPLING:
++            # the checkpoint's numbers win; only `seed` below stays the client's
++            temp = float(self.sampling["temperature"])
++            top_k, top_p = self.sampling["top_k"], self.sampling["top_p"]
++            min_p = self.sampling.get("min_p", 0.0)
++        else:
++            temp = float(fields.get("temperature", self.sampling["temperature"]))
++            top_k = fields.get("top_k", self.sampling["top_k"])
++            top_p = fields.get("top_p", self.sampling["top_p"])
++            min_p = fields.get("min_p", self.sampling.get("min_p", 0.0))
+         if temp <= 0:
+             return None
+         seed = fields.get("seed")
+-        top_k = fields.get("top_k", self.sampling["top_k"])
+-        top_p = fields.get("top_p", self.sampling["top_p"])
+-        min_p = fields.get("min_p", self.sampling.get("min_p", 0.0))
+         return Sampling(int(seed) if seed is not None else seed_for(prompt), temp, int(top_k), float(top_p),
+                         float(min_p))
+ 
