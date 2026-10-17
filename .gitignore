@@ -9,3 +9,4 @@ models/
 .hf-token
 *.safetensors
 *.gguf
+fp4-b12x/b12x-patch/

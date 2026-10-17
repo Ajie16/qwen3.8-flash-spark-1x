@@ -56,7 +56,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Apply the overrides to the remote copy only; the workspace copy stays the reference.
+# Push this directory's launcher to the head node before doing anything else, so the two ranks always
+# run the same file. Rank 1 runs $SCRIPTS_DIR/serve-fp4-tp2.sh and rank 0 runs $REMOTE_SCRIPT; when
+# only one of them was edited the ranks silently diverged (different PLE modes both start fine, and
+# the only evidence is the weights-size line in each log: 38 GB for disk, 56 GB for shared).
+echo "[cfg] syncing launcher to $REMOTE_HOST:$REMOTE_SCRIPT"
+scp -q "$SCRIPTS_DIR/serve-fp4-tp2.sh" "$REMOTE_HOST:$REMOTE_SCRIPT" || {
+    echo "  FAILED to copy $SCRIPTS_DIR/serve-fp4-tp2.sh to $REMOTE_HOST:$REMOTE_SCRIPT"
+    exit 1
+}
+echo "  synced"
+
 if [[ -n "$PLE" || -n "$GMU0" || -n "$GMU1" || -n "$SEQS" || -n "$NBT" || -n "$FAST" ]]; then
     echo "[cfg] applying overrides on $REMOTE_HOST"
     ssh "$REMOTE_HOST" "python3 - <<'PY'
