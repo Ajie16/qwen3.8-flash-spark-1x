@@ -23,6 +23,9 @@
 #                                            # 8192 and 16384 both fail with "preparation ranks
 #                                            # reached incompatible tuning boundaries", even with the
 #                                            # compile cache cleared)
+#   ./tf-restart.sh --model /path/to/checkpoint   # serve a different checkpoint tree (same 21-shard
+#                                                 # layout; the abliterated variants share 19 shards
+#                                                 # with the official one via symlinks)
 #   ./tf-restart.sh --fast                    # cap CUDA graph capture sizes, ~60-80 s faster start
 # The sudo password, when needed for drop_caches and /dev/shm cleanup, is read from
 # ${SUDO_PASS_FILE:-$HOME/sudo-pass} on each host. That file is deliberately not in this repo: it is
@@ -43,6 +46,7 @@ GMU1=""
 SEQS=""
 NBT=""
 FAST=""
+MODEL=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -52,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --seqs) SEQS="$2"; shift 2 ;;
         --nbt)  NBT="$2"; shift 2 ;;
         --fast) FAST=1; shift ;;
+        --model) MODEL="$2"; shift 2 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
@@ -173,10 +178,10 @@ fi
 ssh "$REMOTE_HOST" 'if [ -f ${SUDO_PASS_FILE:-$HOME/sudo-pass} ]; then P=$(cat ${SUDO_PASS_FILE:-$HOME/sudo-pass}); B=$(awk "/^Shmem/{printf \"%0.1f\", \$2/1048576}" /proc/meminfo); echo "$P" | sudo -S sh -c "rm -rf /dev/shm/* 2>/dev/null" 2>/dev/null; A=$(awk "/^Shmem/{printf \"%0.1f\", \$2/1048576}" /proc/meminfo); printf "  ac8f Shmem %s -> %s GiB\n" "$B" "$A"; fi'
 
 echo "[2/4] starting rank1 (worker, headless)"
-bash "$SCRIPTS_DIR/serve-fp4-tp2.sh" 1 >/dev/null 2>&1
+MODEL_DIR="$MODEL" bash "$SCRIPTS_DIR/serve-fp4-tp2.sh" 1 >/dev/null 2>&1
 
 echo "[3/4] starting rank0 (head, API)"
-ssh "$REMOTE_HOST" "bash $REMOTE_SCRIPT 0 >/dev/null 2>&1"
+ssh "$REMOTE_HOST" "MODEL_DIR='$MODEL' bash $REMOTE_SCRIPT 0 >/dev/null 2>&1"
 
 echo "[4/4] waiting for the API (a start-up routes the whole checkpoint, ~4 min)"
 for i in $(seq 1 40); do

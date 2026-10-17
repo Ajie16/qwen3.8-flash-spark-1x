@@ -23,8 +23,11 @@ set -uo pipefail
 ROLE="${1:?usage: $0 0|1   (0=head serving API, 1=worker headless)}"
 
 IMAGE=eugr/spark-vllm-b12x:latest
-NAME=qwen38-fp4-tp2
-MODEL_DIR=/home/xujie/models/Qwen3.8-Flash-Next-FP4-Local
+NAME="${NAME:-qwen38-fp4-tp2}"
+# Overridable so the same launcher serves the offline/abliterated variants, which are the same
+# checkpoint with a handful of tensors replaced -- see docs/fp4-b12x-deployment.md. Their remaining
+# shards are symlinked to this directory, so only the differing ones cost disk.
+MODEL_DIR="${MODEL_DIR:-/home/xujie/models/Qwen3.8-Flash-Next-FP4-Local}"
 CACHE=$HOME/.cache/nvidia-fp4-local
 
 HEAD_IP=10.100.65.1
