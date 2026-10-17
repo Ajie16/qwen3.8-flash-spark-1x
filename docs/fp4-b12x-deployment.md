@@ -295,3 +295,90 @@ TP=1 单机 63.9，TP=2 107.3 = **1.68×**（理想 2×）：
 同日空闲状态下复测：C1 **107.3** / C2 178.1 / C4 **278.1** / C8 **420.9**，与最初的 108.0 / 283.1 / 432.0 一致。
 
 **教训：decode 基准必须在服务完全空闲时跑。** 判据是 `vllm:num_requests_running` 为 0、GPU 利用率采样持续为 0%、`generation_tokens_total` 不增长。`bench.py` 只在每个模式开头做两次预热，挡不住外部并发。
+
+## 反审查（abliterated）变体
+
+`edp1096/Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local` 是同一个 checkpoint，
+用 Huihui v2 的 abliteration 替换了 96 个 MXFP8 投影张量。**其余全部保留 NVIDIA 的原始字节** ——
+README 原话："Routed NVFP4 experts and their CSF scales, PLE, MTP, vision and tokenizer retain the
+NVIDIA checkpoint bytes."
+
+### 只下载 2 个分片，不是 95 GiB
+
+**21 个分片里只有 2 个不同**，用 sha256 逐个比对确认过：
+
+```
+model-00001-of-00021.safetensors   ✗ 不同（96 个变更张量）
+model-00015-of-00021.safetensors   ✗ 不同（96 个变更张量）
+其余 19 个                          ✓ sha256 完全相同
+```
+
+**变更张量共 96 个**，位置很集中：
+
+| 模块 | 层数 |
+|---|---|
+| `mlp.shared_expert.down_proj` | 48 |
+| `linear_attn.out_proj` | 36 |
+| `self_attn.o_proj` | 12 |
+
+`config.json` 与官方**完全一致**（diff 0 行）。
+
+**所以做法是硬链接**：只下 2 个分片（9.86 GB），另外 19 个 `ln` 到官方目录。
+
+```bash
+# 1. 下载 2 个分片 + index + 小文件（aria2c 16 线程，hf-mirror，约 90 秒）
+# 2. 硬链接其余 19 个
+cd ~/models/Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local/tensors
+SRC=~/models/Qwen3.8-Flash-Next-FP4-Local/tensors
+for f in *.safetensors; do
+    [ -f "$f" ] && continue
+    ln "$SRC/$f" "$f"
+done
+```
+
+**必须用硬链接，不能用软链接。** 容器只挂载 `MODEL_DIR:/model`，绝对路径软链指向
+`/home/xujie/models/Qwen3.8-...` 在容器里不存在，会直接加载失败。硬链接在同一文件系统上，
+容器看到的是真实文件。代价只有 9.86 GB 磁盘，不是 96 GB。
+
+### 部署
+
+```bash
+./tf-restart.sh --model /home/xujie/models/Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local
+```
+
+启动器里 `MODEL_DIR="${MODEL_DIR:-<官方路径>}"`，所以直接传环境变量也行。
+
+**实测启动 301 s，KV 2,447,669 token / 9.34×，与官方版一致。**
+
+### 实测：性能不变，审查解除
+
+| 并发 | 官方 | Huihui | 差异 |
+|---|---|---|---|
+| 1 | 107.3 | **108.3** | +1% |
+| 4 | 278.1 | **285.4** | +2.6% |
+| 8 | 420.9 | **433.0** | +2.9% |
+
+**性能在噪声范围内，略高。** 符合预期 —— 只换了 96 个 dense 投影，MoE 路由、CSF scale、PLE、
+MTP 全部是原字节，访存模式不变。
+
+行为对比（关思考、temperature 0）：
+
+| 探测 | 官方版 | Huihui 版 |
+|---|---|---|
+| 粗俗用语 | 会软化 | **直接输出，不软化** |
+| 虚构犯罪场景 | 加道德说教 | **只写场景** |
+| 社工攻击手法 | 拒绝 | **给出详细分类** |
+| 常规问答 | 正常 | 正常 |
+
+### 需要知道的限制
+
+**`runtime_validated: false`。** 上游的 `runtime-qualification.json` 记录了一次失败的检查：
+推理答案是 445（正确），但在要求"只给整数"的指令下仍附带了解方程过程。它把这个记为
+"completed with findings"，不是全项通过。
+
+**同时提到两个版本（含 NVIDIA 原始版）都有散文质量上的局限，以及启动时会用 swap。**
+
+这是**量化 delta 转移**，没有做新的 QAD 训练或激活校准 —— 即"把 donor 模型的差异搬过来再量化回去"，
+不是重新训练。**不能据此推断 refusal rate 与 donor 等价，也不能推断基准分数持平。**
+
+**License**：NVIDIA Open Model Agreement + Qwen Community License 同时适用。
