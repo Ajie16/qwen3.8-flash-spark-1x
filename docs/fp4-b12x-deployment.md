@@ -382,3 +382,150 @@ MTP 全部是原字节，访存模式不变。
 不是重新训练。**不能据此推断 refusal rate 与 donor 等价，也不能推断基准分数持平。**
 
 **License**：NVIDIA Open Model Agreement + Qwen Community License 同时适用。
+
+## 草稿器：是什么、能不能换、为什么换不了
+
+### 当前用的是模型自带的 MTP 头
+
+```
+mtp_num_hidden_layers          1        单层
+mtp_use_dedicated_embeddings   False    ★ 共享主模型 248,320 全词表
+量化                           W4A16_NVFP4 group 16（专家）+ NVFP4（LM head）
+
+--speculative-config {"method":"mtp","num_speculative_tokens":4,
+                      "draft_tensor_parallel_size":2,"draft_sample_method":"greedy"}
+```
+
+服务端统计的平均接受长度在 **2.06–4.95** 之间随内容剧烈波动。
+
+**`mtp_use_dedicated_embeddings: False` 是理解后面一切的关键**：MTP 头直接用主模型的完整
+词表，**不存在"独立的草稿词表"这个可替换对象**。
+
+### 实测接受率（本轮所有测量）
+
+**注意：默认温度是 1.0，不是 0。之前所有基准都用 `temperature=0`，高估了。**
+
+| 用例 | T=0 | **T=1.0（真实默认）** | 损失 |
+|---|---|---|---|
+| 数数（最可预测） | 97.3% | 97.3% | 0 |
+| JSON | 79.0% | 73.2% | −5.8 |
+| 代码 | 73.2% | 71.0% | −2.2 |
+| 英文散文 | 50.2% | 47.5% | −2.7 |
+| 中文技术 | 43.5% | 38.3% | −5.2 |
+| **中文散文** | 30.2% | **27.2%** | −3.0 |
+
+**损失不大**，因为 rejection sampling 会校正分布。**但真实工作点是 27%，不是 30%。**
+
+**数数那个 97% 不能当参考**，极端可预测。
+
+### 试过、无效的两个假设
+
+**① MTP LM head 改 BF16（`VLLM_MTP_NVFP4_LM_HEAD=0`）**
+
+假设：LM head 是 `hidden → 248,320 词表` 的投影，中文 token 在词表里是少数，
+4-bit 的 per-group 量化误差对它们更不利。
+
+```python
+mtp.py:785   lm_head_quantization="nvfp4" if envs.VLLM_MTP_NVFP4_LM_HEAD else None
+```
+
+结果（T=0）：中文散文 **30.0% → 30.2%**，其余全部在噪声内。**假设被推翻，不是量化误差。**
+
+**② 草稿改采样（`draft_sample_method=probabilistic`）**
+
+假设：`greedy` 把草稿分布当 one-hot，在温度 1.0 下是差近似；`probabilistic` 用完整
+logits 做 ratio test，是教科书正确形式。
+
+结果（T=1.0）：中文散文 **27.2% → 26.3%**，技术类 +5.2 但 JSON −7.1，**没有净收益**。
+吞吐也无变化（C1 107.3 vs 108.3）。
+
+**结论：两个旋钮都调过了，中文接受率不动。这是 MTP 头训练数据以英文为主造成的模型属性。**
+
+### ★ DSpark：架构性不可行，不要再试
+
+`DSparkModelTypes = Literal["dspark"]`，代码里只显式支持
+`deepseek_v4` / `deepseek_v41` / `qwen3_dflash`。我们的 `model_type` 是 `qwen4_exp`。
+
+但真正的阻碍不是白名单，是**硬件后端**。上游作者的 DFlash 草稿模型 card 里写得很直接
+（`PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash`）：
+
+> A DSpark variant of this drafter was also trained and is **not** published. It serves at −11.0%
+> against native MTP k=3 and roughly doubles the chat regression, and its per-request confidence
+> gate **cannot run on this target at all**: vLLM's adaptive verification needs to trim
+> verification requests on device, and `GDNAttentionBackend` does not support that. Since
+> Qwen3.8-Flash-Next has **36 GatedDeltaNet layers**, that check can never pass. **This generalises
+> to every Mamba-class hybrid target.**
+
+三点：
+
+1. DSpark 版本训练过，**实测比原生 MTP k=3 慢 11%**
+2. 它的自适应验证依赖 `GDNAttentionBackend` 的设备端裁剪，vLLM 这个后端做不到
+3. Qwen3.8-Flash-Next 有 36 层 GDN —— **这个检查永远不可能通过，且对所有 Mamba 混合架构成立**
+
+### DFlash：能跑，但对聊天是负收益
+
+存在一个 1 GB 的草稿模型 `PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash`
+（5 层、block 7、498M 参数、BF16，taps `[3,15,23,35,43]`）。
+
+**作者自己的结论：**
+
+> this is a **maths drafter**, a code wash, and it makes **chat slower at every block size we can
+> serve**
+
+实测（block 5，对原生 MTP k=4，2×DGX Spark 同构环境）：
+
+| 负载 | DFlash | 95% CI |
+|---|---|---|
+| **数学** | **+28.04%** | [+22.80, +33.37] |
+| 代码 | +0.37% | [−3.17, +4.21]（跨零） |
+| **聊天** | **−5.90%** | [−7.96, −3.89] |
+
+**聊天在每个可服务的 block 上都退化**：block 2/3/4/5/7 = −6.13% / −3.87% / −3.90% / −5.90% / −11.32%。
+综合只有 **+3.87%**，而作者说 boot-to-boot 方差和这个效应一样大。
+
+**中文创作属于 chat，正好是它退化的那一类 —— 装上去中文会更慢。**
+
+而且装它不开箱即用：
+
+> **Stock vLLM cannot load this drafter.** You need three control-flow patches **and** a six-file
+> adapter overlay.
+
+三个补丁分别修 `model_runner.py` 两处、`dflash/speculator.py:69`、模型 allowlist；
+六个文件的 overlay 做 aux 捕获、anchor 约定、Triton kernel offset、target-sharing 注册、
+scheduler 槽位、dflash allowlist。**并且钉死在特定 vLLM commit 和镜像 sha256 上** ——
+和我们的 CSF 专属 B12X 镜像耦合风险很高。
+
+### 原生 MTP 的 k 值扫描：k=4 已经是最优
+
+同一份 card 里的扫描（对 k=4 归一化）：
+
+| 配置 | 聚合 tok/s | 相对 k=4 |
+|---|---|---|
+| MTP k=1 | 41.321 | −17.97% |
+| MTP k=3 | 50.071 | −0.60%（CI 跨零，与 k=4 不可区分） |
+| **MTP k=4（当前）** | **50.371** | — |
+| MTP k=6 | 46.987 | −6.72% |
+
+**k=4 就是最优。** 与本文档"瓶颈在哪"一节的推算一致：verify 是每个 round 一次固定成本，
+所以 K 大一些更划算，但过大时草稿成本超过收益。
+
+### 为什么中文提不上去，以及唯一有效的路
+
+**MTP 头的训练数据以英文为主。** 证据链：
+
+- 英文散文 47.5% vs 中文散文 27.2% —— 同样结构、同样量化，差 20 个点
+- 中文技术 38.3% 高于中文散文 27.2% —— **不是"中文"整体差，是"中文创造性内容"最难预测**
+- 换 LM head 精度无效 → 不是量化误差
+- 换草稿采样方式无效 → 不是采样策略
+
+**唯一被实测证明有效的做法是可替换的草稿词表**，那是方案 B（TensorFold）独有的机制：
+它的 MTP 头用 102,089 行的缩减草稿词表，换成中文扩展版后
+**中文 decode +25–40%、接受率 32% → 57%**。
+
+**这套机制在 vLLM/B12X 上不存在**（`mtp_use_dedicated_embeddings=False`）。
+
+**但要看清代价**：TensorFold 单流只有 47–60 tok/s，是现在 107 tok/s 的一半。
+**为了中文接受率把整体吞吐换掉一半，通常不划算** —— 而且单流的瓶颈本来就是 HBM 带宽
+（C1 只跑到 246 GB/s 的 26%），提高接受率对单流吞吐的边际收益很小。
+
+**如果中文是主要负载，正确做法是走方案 B，不是在这套上继续调。**
