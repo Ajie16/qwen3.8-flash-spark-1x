@@ -69,11 +69,19 @@ b12x_roce_all_reduce.py:295  RoCEnante all-gather is live: first routed shard is
 b12x_roce_all_reduce.py:277  RoCEnante all-reduce is live: first routed all-reduce is 81920 bytes
 ```
 
-### ③ `--max-num-batched-tokens` 只能是 4096
+### ③ `--max-num-batched-tokens`：4096 是选择，不是上限
 
-8192 / 16384 都报 `RuntimeError: preparation ranks reached incompatible tuning boundaries`，**清 B12X 编译缓存无效**（试过三次）。
+**早先这里写的是"只能是 4096，8192/16384 会撞硬边界"。这个结论是错的，实测推翻。**
 
-**这不是写死的尺寸表**，而是 `vllm/v1/worker/b12x_startup.py:291` 的跨 rank 一致性不变量：
+2026-10-17 复测：**8192 和 16384 都能干净启动，零 mismatch 警告，decode 完全不变。**
+
+```
+nbt=8192   无补丁启动 ✓    C1 107.8  C4 288.9  C8 435.8
+nbt=16384  无补丁启动 ✓
+nbt=4096   无补丁启动 ✓    C1 109.0  C4 287.0  C8 435.6
+```
+
+**之前那些失败是竞态，不是尺寸限制。** 报错来自 `vllm/v1/worker/b12x_startup.py:291` 的跨 rank 一致性检查：
 
 ```python
 choices = [key for key, ranks in participants_by_key.items()
@@ -83,8 +91,23 @@ if authorized != pending:
     raise RuntimeError("preparation ranks reached incompatible tuning boundaries")
 ```
 
-补丁掉它（`fp4-b12x/apply_tuning_patch.py`，**已存档为死路**）只把失败推到
-`flashinfer/experimental/b12x/preparation/session.py:1027` 的 `tuning consolidation does not match pending races`。**是连锁断言，逐道打补丁既打地鼠又可能静默算错。**
+**同一个 nbt 值可能这次失败、下次通过。** 所以遇到这个错**先重试**，不要清缓存、更不要打补丁。
+
+**为什么仍然选 4096 —— 换了个理由：内存。**
+
+| nbt | 可用内存（两台） | prefill @45k | decode C1 |
+|---|---|---|---|
+| **4096（当前）** | **44.0 / 44.7 GiB** | 2,496 | **109.0** |
+| 8192 | 41.5 / 41.9 GiB | **2,676（+7%）** | 107.8 |
+| 16384 | **35.1 / 35.7 GiB** | — | — |
+
+**每翻一倍 nbt，每台少 6–7 GiB**（prefill 激活工作区 + CUDA graph 捕获形状随 nbt 线性增长），
+**换来 prefill +3–7%，decode 零变化。**
+
+**6.4 GiB 换算成 KV 是约 55 万 token（12 KiB/token），相当于多两路满窗并发。这比 prefill 的 7% 值。**
+
+**`fp4-b12x/apply_tuning_patch.py` 仍然保持存档状态** —— 它当初是为了绕过那个"边界"，
+现在边界不存在了，补丁也就没有用途。**不要用它。**
 
 ## 实测性能
 
