@@ -1,14 +1,20 @@
-# Qwen3.8-Flash-Next on one DGX Spark — 两条推理路线
+# Qwen3.8-Flash-Next on DGX Spark — 三条推理路线
 
-单台 NVIDIA DGX Spark（GB10 / SM121 / 128 GB 统一内存 / aarch64）上跑
-Qwen3.8-Flash-Next（176B MoE）的两套完整方案。**两条路线互不干扰，按目录隔离。**
+NVIDIA DGX Spark（GB10 / SM121 / 128 GB 统一内存 / aarch64）上跑
+Qwen3.8-Flash-Next（176B MoE）的三套完整方案。**三条路线互不干扰，按目录隔离。**
+
+C 是唯一用**两台** Spark 的路线（CX-7 RoCE 张量并行），A、B 都是单机。
 
 | 路线 | 引擎 | 权重 | 冷 prefill @32k | 目录 |
 |---|---|---|---|---|
 | **A · 原生 EXL3** | exllamav3 1.5.1 fork + TabbyAPI | EXL3 3.05bpw / head5 | **~1,130 tok/s** | [`exllamav3-tabby/`](exllamav3-tabby/) |
 | **B · TensorFold** | TensorFold 0.6.1 | MLX 4-bit affine g32 | **2,425 tok/s** | [`tensorfold-mlx/`](tensorfold-mlx/) |
+| **C · FP4-Local + B12X** | vLLM + b12x（**双机 TP=2**） | nvidia FP4-Local 95 GiB（CSF） | **~2,400 tok/s** | [`fp4-b12x/`](fp4-b12x/) |
 
 > 数字是各自实测，**不同模型/不同会话不可直接比**（见下方"为什么快慢不同"）。
+>
+> **解码吞吐**（这条差距比 prefill 大得多）：A 48.3 单流 / 56 @C4；B 47.7 / 110；
+> **C 111.5 / 616 @C16**。C 是审查版权重。
 
 ---
 
@@ -23,9 +29,16 @@ TensorFold 的 `qwen4_exp` CUDA family **只接受** `bits=4, group_size=32, mod
 MLX 社区默认分组是 64，**抗审查的 MLX 包清一色 g64，会被直接拒绝加载**。
 目前 g32 的只有官方（审查）包，抗审查要自己从 BF16 源转。
 
+**要吞吐 → 路线 C，但要两台 Spark 且是审查版权重。**
+C 用 CX-7 RoCE 做 TP=2，单流 111.5、16 并发 616 tok/s，是 A/B 的 2–11 倍。
+代价：`nvidia/Qwen3.8-Flash-Next-FP4-Local` 的权重带 `nvfp4_csf_*` 压缩 scale，
+**只有 `eugr/spark-vllm-b12x` 镜像能解**，且格式拒绝 `--enable-expert-parallel`
+（所以 MoE 只能按张量切，跨机 all-reduce 必须靠 `VLLM_ENABLE_ROCE_ALLREDUCE`）。
+详见 [`docs/fp4-b12x-deployment.md`](docs/fp4-b12x-deployment.md)。
+
 ---
 
-## 两条路线的关键差异
+## 三条路线的关键差异
 
 | | A · 原生 EXL3 | B · TensorFold |
 |---|---|---|
@@ -47,6 +60,10 @@ TensorFold 的 EXL3 路径（同一引擎、同一张卡）实测只有 805 tok/
 ---
 
 ## 仓库布局
+
+`fp4-b12x/` 是路线 C 的启动器、重启工具、基准脚本与上游参考配方；
+部署细节、三条决定成败的设置、内存泄漏与未解决问题在
+[`docs/fp4-b12x-deployment.md`](docs/fp4-b12x-deployment.md)。
 
 ```
 .
@@ -205,6 +222,26 @@ bash launchers/tf-serve-mlx-int8.sh
 详见 [`tensorfold-mlx/README.md`](tensorfold-mlx/README.md)。
 
 ---
+
+### 路线 C（FP4-Local + B12X，双机）
+
+```bash
+# 前置：两台都已放好 nvidia/Qwen3.8-Flash-Next-FP4-Local（95.12 GiB / 21 分片）
+#      镜像 eugr/spark-vllm-b12x 已 docker load（arm64）
+
+cd fp4-b12x
+./tf-restart.sh                    # 一条命令：停→清缓存→清 shm→启→等→报告（约 5 分钟）
+python3 bench.py decode --n 1,4,8  # 验证
+```
+
+**三条不能省的设置**（少一条就起不来或掉一半性能）：
+
+1. `--device /dev/infiniband:/dev/infiniband` + `--cap-add SYS_NICE`
+   否则 NCCL 静默退回 TCP，616 → 281 tok/s。
+2. `VLLM_ENABLE_ROCE_ALLREDUCE=1` + `VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB`
+   + `draft_tensor_parallel_size: 2`。裸 NCCL 只有 +23%，换它到 +75%。
+3. `--max-num-batched-tokens 4096`。8192/16384 会撞 B12X 的跨 rank 一致性断言，
+   清编译缓存无效。
 
 ## 硬件前提
 

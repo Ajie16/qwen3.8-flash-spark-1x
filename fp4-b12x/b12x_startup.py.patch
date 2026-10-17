@@ -1,0 +1,21 @@
+--- /tmp/patchdiff/orig.py	2026-10-17 16:21:45.272234001 +0800
++++ b12x-patch/b12x_startup.py	2026-10-17 16:21:11.321195484 +0800
+@@ -287,8 +287,16 @@
+             authorized = {item[0] for item in tuning}
+             pending = {item[0] for entry in gathered for item in entry["tuning"]}
+             if authorized != pending:
+-                raise RuntimeError(
+-                    "preparation ranks reached incompatible tuning boundaries"
++                # PATCHED (see tensorfold-mlx/scripts/b12x-patch/apply_tuning_patch.py): a key that
++                # some rank offered but not every participant marked ready is dropped from `choices`
++                # above. Raising made any batch size whose kernel grid leaves one rank unready
++                # unusable -- that is what blocks --max-num-batched-tokens 8192/16384 on this TP=2
++                # pair. Log the mismatch and keep the winners we do have; the affected kernel falls
++                # back to its untuned path.
++                logger.warning(
++                    "b12x preparation tuning key mismatch: unready=%s unexpected=%s",
++                    sorted(pending - authorized),
++                    sorted(authorized - pending),
+                 )
+         return dict(
+             stop=stop,
